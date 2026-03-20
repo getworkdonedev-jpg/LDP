@@ -24,5 +24,10 @@ decrypt.js
 
 # Personal Config
 config.json
+mcp.json
 .vscode/
 .idea/
+
+# Build Artifacts
+dist/
+out/
