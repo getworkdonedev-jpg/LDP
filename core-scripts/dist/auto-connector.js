@@ -16,6 +16,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { createRequire } from "node:module";
+import { LDPBrain } from "./brain.js";
+const require = createRequire(import.meta.url);
 // ── Known app fingerprints (heuristic, no AI needed) ─────────────────────────
 const KNOWN_FINGERPRINTS = [
     {
@@ -52,44 +55,6 @@ const KNOWN_FINGERPRINTS = [
             recent_plays: "Last 100 tracks played",
             long_sessions: "Listening sessions longer than 2 hours",
         },
-    },
-    {
-        pattern: /WhatsApp.*ChatStorage|WhatsApp.*Contacts/i,
-        app: "WhatsApp",
-        category: "messaging",
-        permissions: ["messages.read", "contacts.read"],
-        namedQueries: {
-            top_contacts: "People messaged most in last 30 days",
-            recent_chats: "Last 20 conversations",
-            media_shared: "Messages containing media attachments",
-            group_activity: "Most active group chats",
-        },
-    },
-    {
-        pattern: /Telegram.*cache4\.db|tdlib.*.*\.db/i,
-        app: "Telegram",
-        category: "messaging",
-        permissions: ["messages.read"],
-        namedQueries: {
-            top_contacts: "Most active contacts",
-            channels: "Channels with unread count",
-        },
-    },
-    {
-        pattern: /Signal.*db\.sqlite|signal-messenger/i,
-        app: "Signal",
-        category: "messaging",
-        permissions: ["messages.read"],
-        namedQueries: {
-            conversations: "Active conversations sorted by recency",
-        },
-        connectionHints: {
-            encryption: "sqlcipher",
-            keychainService: "Signal Safe Storage",
-            pbkdf2Salt: "saltysalt",
-            pbkdf2Iter: 1003,
-            ivFormat: "spaces"
-        }
     },
     {
         pattern: /VSCode.*globalStorage|vscode.*\.vscdb/i,
@@ -205,6 +170,7 @@ const DEFAULT_SKIP = [
     "CrashpadMetrics", "pnacl", "Crashpad",
     "System Preferences", "CoreServicesUIAgent",
     ".Trash", "Logs", "logs", "tmp", "temp",
+    "StoreKit.db", "DriveFS/root_preference_sqlite.db",
 ];
 // ── SQLite schema reader (pure Node.js, no native deps) ──────────────────────
 function readSQLiteSchema(filePath) {
@@ -251,6 +217,49 @@ function readSQLiteSchema(filePath) {
         return null;
     }
 }
+function getDatabaseDensity(filePath, tableNames) {
+    let total = 0;
+    let max = 0;
+    let db;
+    let tmpPath = null;
+    try {
+        const DB = require("better-sqlite3");
+        // Always use a temp copy for density check to avoid locks from running apps
+        tmpPath = path.join(os.tmpdir(), `ldp_auto_${Math.random().toString(36).slice(2)}.db`);
+        fs.copyFileSync(filePath, tmpPath);
+        db = new DB(tmpPath, { readonly: true, timeout: 2000 });
+        let actualTables = tableNames;
+        if (actualTables.length === 0) {
+            const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 20").all();
+            actualTables = rows.map((r) => r.name);
+        }
+        for (const t of actualTables.slice(0, 15)) {
+            try {
+                const res = db.prepare(`SELECT count(*) as count FROM "${t}"`).get();
+                total += res.count;
+                if (res.count > max)
+                    max = res.count;
+            }
+            catch { }
+        }
+    }
+    catch (e) {
+        // console.warn(`[LDP AutoGen] Density check failed for ${filePath}:`, e.message);
+    }
+    finally {
+        if (db)
+            try {
+                db.close();
+            }
+            catch { }
+        if (tmpPath)
+            try {
+                fs.unlinkSync(tmpPath);
+            }
+            catch { }
+    }
+    return { total, max };
+}
 // ── File scanner ─────────────────────────────────────────────────────────────
 function scanForDatabases(roots, skipPatterns, maxFiles) {
     const found = [];
@@ -281,14 +290,20 @@ function scanForDatabases(roots, skipPatterns, maxFiles) {
                 continue;
             }
             // SQLite files
-            if (entry.isFile() && (lname.endsWith(".db") ||
-                lname.endsWith(".sqlite") ||
-                lname.endsWith(".sqlite3") ||
-                lname === "history" ||
-                lname === "places.sqlite" ||
-                lname === "cookies" ||
-                lname === "web data")) {
-                found.push(fullPath);
+            if (entry.isFile()) {
+                if (skipPatterns.some(p => fullPath.includes(p)))
+                    continue;
+                if (lname.endsWith(".db") ||
+                    lname.endsWith(".sqlite") ||
+                    lname.endsWith(".sqlite3") ||
+                    lname.endsWith(".vscdb") ||
+                    lname.endsWith(".db3") ||
+                    lname === "history" ||
+                    lname === "places.sqlite" ||
+                    lname === "cookies" ||
+                    lname === "web data") {
+                    found.push(fullPath);
+                }
             }
         }
     }
@@ -300,9 +315,31 @@ function scanForDatabases(roots, skipPatterns, maxFiles) {
 }
 // ── Heuristic app identifier ─────────────────────────────────────────────────
 function identifyByFingerprint(filePath) {
+    // 1. Try hardcoded fingerprints
     for (const fp of KNOWN_FINGERPRINTS) {
         if (fp.pattern.test(filePath))
             return fp;
+    }
+    // 2. Try dynamic brain knowledge
+    const brain = new LDPBrain();
+    const staticApps = brain.knowledge.listStatic();
+    for (const app of staticApps) {
+        // Convert glob-like pattern to regex simple
+        const regex = new RegExp(app.pathPattern.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*"), "i");
+        if (regex.test(filePath)) {
+            return {
+                pattern: regex,
+                app: app.name,
+                category: app.category,
+                permissions: [`${app.category}.read`],
+                namedQueries: { all: `All records from ${app.name}` },
+                connectionHints: {
+                    encryption: app.strategy === "plain_sqlite" ? "none" : "sqlcipher",
+                    autoRegister: app.autoRegister,
+                    requiresConsent: app.requiresConsent
+                }
+            };
+        }
     }
     return null;
 }
@@ -393,6 +430,13 @@ function buildConnector(descriptor, sourcePath) {
                 const tmp = path.join(os.tmpdir(), `ldp_auto_${Date.now()}.db`);
                 fs.copyFileSync(sourcePath, tmp);
                 const db = new Database(tmp, { readonly: true });
+                // Check for encryption via brain
+                const brain = new LDPBrain();
+                const appName = descriptor.app;
+                const solve = await brain.decrypt.solve(sourcePath, appName);
+                if (solve && solve.method !== "plain_sqlite" && solve.key) {
+                    db.prepare(`PRAGMA key = "x'${solve.key}'"`).run();
+                }
                 const cols = matchedTable.columns.map(c => c.name).join(", ");
                 const sql = `SELECT ${cols} FROM "${matchedTable.name}" LIMIT ${limit}`;
                 const rows = db.prepare(sql).all();
@@ -444,6 +488,23 @@ export class AutoConnectorGenerator {
                 const result = await this.generateForFile(filePath);
                 if (!result)
                     continue;
+                // Density Rules:
+                // Rule 3: total < 10 -> low priority, no auto-register
+                // Rule 4: at least one table > 10 -> auto-register
+                const hints = result.descriptor.connectionHints;
+                const totalRows = hints?.totalRows ?? 0;
+                const maxRows = hints?.maxRows ?? 0;
+                // Whitelist high-value known sources
+                const isWhitelisted = result.descriptor.app === "Google Chrome" ||
+                    result.descriptor.app === "Signal" ||
+                    result.confidence >= 0.8 ||
+                    result.method === "known-app";
+                const isLowPriority = totalRows < 10;
+                const canAutoRegister = maxRows > 10 || isWhitelisted;
+                if (isLowPriority && !isWhitelisted) {
+                    console.warn(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
+                    continue;
+                }
                 if (result.confidence < 0.3)
                     continue; // skip very uncertain
                 if (seen.has(result.descriptor.app))
@@ -463,9 +524,12 @@ export class AutoConnectorGenerator {
      * Returns null if the file is not a recognisable database.
      */
     async generateForFile(filePath) {
-        // 1. Try known fingerprint first (instant, no AI)
+        // 1. Try known fingerprint (instant, no AI)
         const fp = identifyByFingerprint(filePath);
         if (fp) {
+            const schema = readSQLiteSchema(filePath);
+            const tableNames = schema?.tables.map(t => t.name) ?? [];
+            const density = getDatabaseDensity(filePath, tableNames);
             const descriptor = {
                 name: fp.app.toLowerCase().replace(/\s+/g, "_"),
                 app: fp.app,
@@ -474,6 +538,12 @@ export class AutoConnectorGenerator {
                 permissions: fp.permissions,
                 namedQueries: fp.namedQueries,
                 description: `Auto-detected ${fp.app} ${fp.category} database`,
+                connectionHints: {
+                    totalRows: density.total,
+                    maxRows: density.max,
+                    isLowPriority: density.total > 0 && density.total < 10,
+                    canAutoRegister: density.max > 10 || density.total === 0 // If encrypted (0 rows detected), allow auto-register
+                }
             };
             return {
                 descriptor,
@@ -483,10 +553,21 @@ export class AutoConnectorGenerator {
                 method: "known-app",
             };
         }
-        // 2. Read schema
+        // 2. Read schema & Density
         const schema = readSQLiteSchema(filePath);
         if (!schema || schema.tables.length === 0)
             return null;
+        const tableNames = schema.tables.map(t => t.name);
+        const density = getDatabaseDensity(filePath, tableNames);
+        if (density.total === 0) {
+            return null;
+        }
+        const hints = {
+            totalRows: density.total,
+            maxRows: density.max,
+            isLowPriority: density.total < 10,
+            canAutoRegister: density.max > 10
+        };
         // 3. Try AI analysis
         if (this.opts.apiKey) {
             const ai = await analyseWithAI(filePath, schema, this.opts.apiKey, this.opts.model);
@@ -498,7 +579,8 @@ export class AutoConnectorGenerator {
                     dataPaths: [filePath],
                     permissions: ai.permissions,
                     namedQueries: ai.namedQueries,
-                    description: ai.description,
+                    description: ai.description ?? `Auto-scanned ${ai.appName} database`,
+                    connectionHints: hints
                 };
                 return {
                     descriptor,
@@ -520,6 +602,7 @@ export class AutoConnectorGenerator {
                 permissions: heuristic.permissions,
                 namedQueries: heuristic.namedQueries,
                 description: heuristic.description,
+                connectionHints: hints
             };
             return {
                 descriptor,

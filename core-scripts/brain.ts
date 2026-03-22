@@ -31,6 +31,7 @@ export type DataCategory =
 
 export type DecryptMethod =
   | "plain_sqlite"
+  | "sqlcipher_chromium_safestore"
   | "sqlcipher_pbkdf2_spaces_iv"
   | "sqlcipher_pbkdf2_embedded_iv"
   | "sqlcipher_direct_hex"
@@ -67,6 +68,16 @@ interface DecryptStrategy {
 export type BrainErrorType =
   | "decrypt_failed" | "file_locked" | "permission_denied"
   | "schema_changed" | "file_not_found" | "unknown";
+
+export interface StaticApp {
+  name:            string;
+  pathPattern:     string;
+  category:        DataCategory;
+  strategy:        DecryptMethod;
+  requiresConsent: boolean;
+  autoRegister:    boolean;
+  params:          Record<string, unknown>;
+}
 
 export interface BrainDiagnosis {
   errorType:   BrainErrorType;
@@ -194,15 +205,53 @@ async function defaultCLIPrompt(msg: string): Promise<boolean> {
 export class KnowledgeBase {
   private store = new Map<string, KnownSolution>();
   private readonly cry = getCrypto();
+  private staticApps: StaticApp[] = [];
 
   constructor() { this.load(); }
 
   private load() {
     try {
+      // 1. Initialise with static knowledge
+      this.loadStatic();
+
+      // 2. Load learned knowledge
       const raw = this.cry.readEncrypted<Record<string, KnownSolution>>(KNOWLEDGE_FILE);
       for (const [k, v] of Object.entries(raw)) this.store.set(k, v);
     } catch {}
   }
+
+  private loadStatic() {
+    try {
+      const staticFile = path.join(path.dirname(KNOWLEDGE_FILE).replace(".ldp", "LDP/core-scripts"), "brain_knowledge.json");
+      const fallbackFile = path.join(process.cwd(), "brain_knowledge.json");
+      const target = fs.existsSync(staticFile) ? staticFile : fallbackFile;
+      
+      if (fs.existsSync(target)) {
+        const raw = JSON.parse(fs.readFileSync(target, "utf-8"));
+        if (raw.apps) {
+          this.staticApps = raw.apps;
+          for (const app of this.staticApps) {
+            const appKey = `static_${app.name.toLowerCase()}`;
+            this.store.set(appKey, {
+              appKey,
+              appName:      app.name,
+              filePath:     app.pathPattern,
+              method:       app.strategy,
+              params:       app.params,
+              solvedAt:     0,
+              solvedOnOS:   "any",
+              successCount: 0,
+              failureCount: 0,
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[BRAIN] Failed to load static knowledge:", e);
+    }
+  }
+
+  listStatic(): StaticApp[] { return this.staticApps; }
 
   private save() {
     const obj: Record<string, KnownSolution> = {};
@@ -372,6 +421,28 @@ export class DecryptionBrain {
 
   private buildStrategies(): DecryptStrategy[] {
     return [
+      {
+        method: "sqlcipher_chromium_safestore", description: "Chromium SafeStore (v10 format, spaces IV)", rank: 0.5,
+        tryFn: async (fp, appName) => {
+          // Check for static params first
+          const known = this.kb.lookupByApp(appName);
+          const service = (known?.params?.keychainService as string) ?? `${appName} Safe Storage`;
+          const pw = getKeychainPw(service);
+          if (!pw) return { success: false, error: `Keychain: "${service}" not found` };
+          
+          const encKey = getEncryptedKey(appName, fp);
+          if (!encKey) return { success: false, error: "config.json / encryptedKey not found" };
+          
+          const iters = (known?.params?.iterations as number) ?? 1003;
+          const ivFmt = (known?.params?.ivFormat as "spaces"|"embedded") ?? "spaces";
+
+          try {
+            const dbKey = decryptChromiumKey(encKey, deriveChromiumKey(pw, iters), ivFmt);
+            const r = tryOpenSQLCipher(fp, `key = "x'${dbKey}'"`);
+            return r.success ? { ...r, key: dbKey } : r;
+          } catch (e: any) { return { success: false, error: String(e?.message ?? e) }; }
+        },
+      },
       {
         method: "plain_sqlite", description: "Plain unencrypted SQLite", rank: 0,
         tryFn: async (fp) => {

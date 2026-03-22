@@ -19,6 +19,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { ConnectorDescriptor, BaseConnector, Row, SchemaMap } from "./types.js";
 import { createRequire } from "node:module";
+import { LDPBrain } from "./brain.js";
 
 const require = createRequire(import.meta.url);
 
@@ -102,44 +103,6 @@ const KNOWN_FINGERPRINTS: Array<{
         recent_plays: "Last 100 tracks played",
         long_sessions: "Listening sessions longer than 2 hours",
       },
-    },
-    {
-      pattern: /WhatsApp.*ChatStorage|WhatsApp.*Contacts/i,
-      app: "WhatsApp",
-      category: "messaging",
-      permissions: ["messages.read", "contacts.read"],
-      namedQueries: {
-        top_contacts: "People messaged most in last 30 days",
-        recent_chats: "Last 20 conversations",
-        media_shared: "Messages containing media attachments",
-        group_activity: "Most active group chats",
-      },
-    },
-    {
-      pattern: /Telegram.*cache4\.db|tdlib.*.*\.db/i,
-      app: "Telegram",
-      category: "messaging",
-      permissions: ["messages.read"],
-      namedQueries: {
-        top_contacts: "Most active contacts",
-        channels: "Channels with unread count",
-      },
-    },
-    {
-      pattern: /Signal.*db\.sqlite|signal-messenger/i,
-      app: "Signal",
-      category: "messaging",
-      permissions: ["messages.read"],
-      namedQueries: {
-        conversations: "Active conversations sorted by recency",
-      },
-      connectionHints: {
-        encryption: "sqlcipher",
-        keychainService: "Signal Safe Storage",
-        pbkdf2Salt: "saltysalt",
-        pbkdf2Iter: 1003,
-        ivFormat: "spaces"
-      }
     },
     {
       pattern: /VSCode.*globalStorage|vscode.*\.vscdb/i,
@@ -412,8 +375,31 @@ function scanForDatabases(
 // ── Heuristic app identifier ─────────────────────────────────────────────────
 
 function identifyByFingerprint(filePath: string) {
+  // 1. Try hardcoded fingerprints
   for (const fp of KNOWN_FINGERPRINTS) {
     if (fp.pattern.test(filePath)) return fp;
+  }
+
+  // 2. Try dynamic brain knowledge
+  const brain = new LDPBrain();
+  const staticApps = brain.knowledge.listStatic(); 
+  for (const app of staticApps) {
+    // Convert glob-like pattern to regex simple
+    const regex = new RegExp(app.pathPattern.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*"), "i");
+    if (regex.test(filePath)) {
+      return {
+        pattern: regex,
+        app: app.name,
+        category: app.category,
+        permissions: [`${app.category}.read`],
+        namedQueries: { all: `All records from ${app.name}` },
+        connectionHints: {
+            encryption: app.strategy === "plain_sqlite" ? "none" : "sqlcipher",
+            autoRegister: app.autoRegister,
+            requiresConsent: app.requiresConsent
+        }
+      };
+    }
   }
   return null;
 }
@@ -536,6 +522,15 @@ function buildConnector(
         fs.copyFileSync(sourcePath, tmp);
         
         const db = new Database(tmp, { readonly: true });
+        
+        // Check for encryption via brain
+        const brain = new LDPBrain();
+        const appName = descriptor.app;
+        const solve = await brain.decrypt.solve(sourcePath, appName);
+        if (solve && solve.method !== "plain_sqlite" && solve.key) {
+           db.prepare(`PRAGMA key = "x'${solve.key}'"`).run();
+        }
+
         const cols = matchedTable.columns.map(c => c.name).join(", ");
         const sql = `SELECT ${cols} FROM "${matchedTable.name}" LIMIT ${limit}`;
         

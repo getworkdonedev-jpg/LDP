@@ -299,12 +299,10 @@ def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
                 path = Path(p_str)
     
     if path is None or not path.exists():
-        if "signal" in name_low: return tool_signal_messages(limit=limit)
         return f"App '{app_name}' not found locally."
 
     # 3. Handle Encryption
-    if "signal" in name_low:
-        return tool_signal_messages(limit=limit)
+    # (Encryption is now handled by auto-connector.ts via LDPBrain)
     
     # 4. Smart Query Logic: Provide sensible defaults for known apps
     actual_query = query
@@ -440,57 +438,7 @@ def tool_diagnostics() -> str:
         "capabilities": ["Signal-SQLCipher", "iMessage-SmartQuery", "AppleNotes-Heuristic", "AppleMail-GmailProxy", "Dynamic-AutoConnect", "Global-Search", "FDA-Diagnostics"]
     }, indent=2)
 
-def tool_signal_messages(limit: int = 10, query_type: str = "messages") -> str:
-    """Decrypt and read Signal messages."""
-    try:
-        # 1. Get Key from Keychain
-        res = subprocess.run(["security", "find-generic-password", "-s", "Signal Safe Storage", "-w"], capture_output=True, text=True)
-        keychain_pass = res.stdout.strip()
-        
-        # 2. Decrypt Signal Key from config
-        config = json.loads(SIGNAL_CONFIG.read_text())
-        enc_key = config["encryptedKey"]
-        
-        # We'll use the Node tool for the heavy lifting of SQLCipher
-        sql = "SELECT body, sent_at FROM messages ORDER BY sent_at DESC LIMIT " + str(limit)
-        if query_type == "conversations":
-            sql = "SELECT name FROM conversations WHERE name IS NOT NULL LIMIT " + str(limit)
 
-        sql_safe = json.dumps(sql)
-        node_code = f"""
-const {{ Database }} = require('{CORE_SCRIPTS}/node_modules/@signalapp/sqlcipher');
-const crypto = require('crypto');
-const fs = require('fs');
-
-// Decrypt the key v10
-const keychainPass = {json.dumps(keychain_pass)};
-const encKey = {json.dumps(enc_key)};
-const salt = Buffer.from('saltysalt'); // Note: Signal salt is traditionally 'saltysalt' for v10
-const iterations = 1003;              // Note: Signal iterations is traditionally 1003 for v10
-const derivedKey = crypto.pbkdf2Sync(keychainPass, salt, iterations, 16, 'sha1');
-const ciphertext = Buffer.from(encKey, 'hex').slice(3);
-const iv = Buffer.from(' '.repeat(16)); // Note: Signal IV is traditionally 16 spaces for v10
-const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv);
-let decrypted = decipher.update(ciphertext);
-decrypted = Buffer.concat([decrypted, decipher.final()]);
-const dbKey = decrypted.toString().trim();
-
-const tmp = '/tmp/sig.' + Date.now() + '.db';
-fs.copyFileSync('{SIGNAL_DB}', tmp);
-const db = new Database(tmp);
-db.pragma(`key = "x'${{dbKey}}'"`);
-console.log(JSON.stringify(db.prepare({sql_safe}).all()));
-db.close();
-fs.unlinkSync(tmp);
-"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.cjs', delete=False) as f:
-            f.write(node_code)
-            tmp_path = f.name
-        
-        res = subprocess.run(["node", tmp_path], capture_output=True, text=True)
-        os.unlink(tmp_path)
-        return res.stdout if res.returncode == 0 else f"Error: {res.stderr}"
-    except Exception as e: return f"Error: {e}"
 
 # ── MCP Protocol ──────────────────────────────────────────────────
 

@@ -71,7 +71,6 @@ export { LDPCrypto, getCrypto, LDP_DIR } from "./crypto.js";
 export { MCPAdapter } from "./mcp.js";
 // ── Connectors ────────────────────────────────────────────────────────────────
 export { ChromeConnector, SyntheticChromeConnector } from "./chrome.js";
-export { SignalConnector } from "./signal.js";
 export { SyntheticSpotifyConnector, SyntheticBankingConnector, SyntheticFilesConnector, SyntheticWhatsAppConnector, registerAllSynthetic, } from "./synthetic.js";
 // ── NEW v2.0 — Agentic RAG ────────────────────────────────────────────────────
 // export { AgenticRAG }      from "./rag.js";

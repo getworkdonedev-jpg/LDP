@@ -1,4 +1,4 @@
-# Signal MCP Local Data Connector
+# LDP (Local Data Protocol) Server
 
 A powerful local MCP server that allows Cursor (or any MCP client) to query your Signal Desktop messages, Chrome history, shell history, and more — all from your local machine.
 
@@ -31,7 +31,7 @@ A powerful local MCP server that allows Cursor (or any MCP client) to query your
    - Add a new server:
      - **Name**: `LDP-Local`
      - **Type**: `command`
-     - **Command**: `python3 /Users/karthikperumalla/Desktop/LDP/signal-mcp/ldp_server.py`
+     - **Command**: `python3 /Users/karthikperumalla/Desktop/LDP/ldp-server/ldp_server.py`
 
 ## 🔒 Security
 This server runs entirely locally. It reads your Signal database by fetching the `Signal Safe Storage` key from your macOS Keychain. No data is ever sent to external servers.

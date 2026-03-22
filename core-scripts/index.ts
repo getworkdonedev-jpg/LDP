@@ -105,7 +105,6 @@ export type { MCPTool, MCPToolResult } from "./mcp.js";
 
 // ── Connectors ────────────────────────────────────────────────────────────────
 export { ChromeConnector, SyntheticChromeConnector } from "./chrome.js";
-export { SignalConnector }                            from "./signal.js";
 export {
   SyntheticSpotifyConnector,
   SyntheticBankingConnector,
