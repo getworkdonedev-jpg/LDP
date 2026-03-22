@@ -191,8 +191,11 @@ class ApprovalManager:
     def save(self):
         self.approvals_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(self.approvals_file, "w") as f:
+            import tempfile, os
+            fd, tmp = tempfile.mkstemp(dir=self.approvals_file.parent, prefix=".approvals.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
                 json.dump(self.state, f, indent=2)
+            os.replace(tmp, self.approvals_file)
         except Exception as e:
             sys.stderr.write(f"[LDP] Error saving approvals: {e}\n")
 
@@ -1185,12 +1188,22 @@ import urllib.parse
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
+
+    def send_cors_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
         
     def do_GET(self):
-        if self.path == "/api/state":
+        if self.path == "/api/connectors":
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_cors_headers()
             self.end_headers()
             
             d_state = { "tools": {} }
@@ -1200,10 +1213,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }
             
             def add_tool_state(name, cat):
+                # Using our overrides or category approvals
+                approved = not approvals.is_app_denied(name, cat)
+                paused = approvals.is_app_paused(name)
+                # Check category directly if no override
+                can_retry = True
+                if hasattr(approvals, "state"):
+                    cat_state = approvals.state.get(cat, {})
+                    can_retry = cat_state.get("can_retry", True)
+                    
+                overrides = approvals.state.get("__app_overrides__", {})
+                if name in overrides:
+                    can_retry = overrides[name].get("can_retry", True)
+                
                 d_state["tools"][name] = {
                     "name": name, "category": cat,
-                    "approved": not approvals.is_app_denied(name, cat),
-                    "paused": approvals.is_app_paused(name)
+                    "approved": approved,
+                    "paused": paused,
+                    "can_retry": can_retry
                 }
                 
             for st in ALL_STATIC_TOOLS: add_tool_state(st["name"], STATIC_MAP.get(st["name"], "unknown"))
@@ -1215,6 +1242,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/":
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
+            self.send_cors_headers()
             self.end_headers()
             
             html = """<!DOCTYPE html>
@@ -1230,10 +1258,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     .btn-off { background: #ff4b4b; color: #fff; }
     .btn-pause { background: #f1c40f; color: #000; }
     .btn-orange { background: #e67e22; color: #fff; }
+    .btn-gray { background: #555; color: #fff; }
     .status { margin-right: 20px; font-weight: 700; font-size: 14px; display: inline-block; width: 100px; text-align: right; }
     .on-text { color: #1ecc66; }
     .off-text { color: #ff4b4b; }
     .paused-text { color: #f1c40f; }
+    .gray-text { color: #888; }
 </style>
 </head><body>
     <h1 style="margin-bottom:5px;">LDP Dashboard</h1>
@@ -1241,27 +1271,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
     <div id="tools"></div>
     <script>
         async function fetchState() {
-            const res = await fetch('/api/state');
+            const res = await fetch('/api/connectors');
             const data = await res.json();
             const container = document.getElementById('tools');
             container.innerHTML = '';
             
             for (const [name, info] of Object.entries(data.tools)) {
-                let statusText = '<span class="status on-text">ON ●</span>';
-                let actionBtns = `
-                    <button class="btn btn-pause" onclick="toggle('${name}', true, true)">PAUSE ⏸</button>
-                    <button class="btn btn-off" onclick="toggle('${name}', false, false)">REVOKE ⨉</button>
-                `;
+                let statusText = '';
+                let actionBtns = '';
                 
-                if (!info.approved) {
-                    statusText = '<span class="status off-text">OFF ○</span>';
-                    actionBtns = `<button class="btn btn-orange" onclick="toggle('${name}', true, false)">Re-enable?</button>`;
-                } else if (info.paused) {
+                if (info.approved && !info.paused) {
+                    statusText = '<span class="status on-text">ON ●</span>';
+                    actionBtns = `
+                        <button class="btn btn-pause" onclick="postAction('/api/pause', '${name}')">PAUSE ⏸</button>
+                        <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
+                    `;
+                } else if (info.approved && info.paused) {
                     statusText = '<span class="status paused-text">PAUSED ⏸</span>';
                     actionBtns = `
-                        <button class="btn btn-on" onclick="toggle('${name}', true, false)">RESUME ▶</button>
-                        <button class="btn btn-off" onclick="toggle('${name}', false, false)">REVOKE ⨉</button>
+                        <button class="btn btn-on" onclick="postAction('/api/resume', '${name}')">RESUME ▶</button>
+                        <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
                     `;
+                } else if (!info.approved && info.can_retry) {
+                    statusText = '<span class="status off-text" style="color:#e67e22;">OFF ○</span>';
+                    actionBtns = `<button class="btn btn-orange" onclick="postAction('/api/approve', '${name}')">RE-ENABLE?</button>`;
+                } else {
+                    statusText = '<span class="status gray-text">OFF ○</span>';
+                    actionBtns = `<button class="btn btn-gray" onclick="postAction('/api/approve', '${name}')">ENABLE</button>`;
                 }
                 
                 const pretty = name.replace('ldp_', '').replace('_query', '').replace('_history', '').replace(/_/g, ' ');
@@ -1285,10 +1321,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }
         }
         
-        async function toggle(name, approved, paused) {
-            await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name, approved, paused}) });
+        async function postAction(endpoint, name) {
+            await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name}) });
             fetchState();
         }
+        
+        async function revokeAction(name) {
+            if (confirm(`Are you sure you want to revoke access to ${name}?`)) {
+                await postAction('/api/revoke', name);
+            }
+        }
+        
         setInterval(fetchState, 3000);
         fetchState();
     </script>
@@ -1296,23 +1339,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode())
 
     def do_POST(self):
-        if self.path == "/api/toggle":
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length).decode())
-            approvals.set_app_state(data.get("name"), data.get("approved", True), data.get("paused", False))
-            rebuild_tools()
-            self.send_response(200)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(b'{"status": "ok"}')
+        length = int(self.headers.get('Content-Length', 0))
+        data = json.loads(self.rfile.read(length).decode()) if length > 0 else {}
+        name = data.get("name")
+        
+        if self.path == "/api/approve":
+            approvals.set_app_state(name, approved=True, paused=False)
+            if "__app_overrides__" in approvals.state and name in approvals.state["__app_overrides__"]:
+                approvals.state["__app_overrides__"][name]["can_retry"] = False
+                approvals.save()
+        elif self.path == "/api/pause":
+            approvals.set_app_state(name, approved=True, paused=True)
+        elif self.path == "/api/resume":
+            approvals.set_app_state(name, approved=True, paused=False)
+        elif self.path == "/api/revoke":
+            approvals.set_app_state(name, approved=False, paused=False)
+            if "__app_overrides__" in approvals.state and name in approvals.state["__app_overrides__"]:
+                approvals.state["__app_overrides__"][name]["can_retry"] = True
+                approvals.save()
+        
+        rebuild_tools()
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(b'{"status": "ok"}')
 
 def start_dashboard_server():
+    server = None
+    port = 8765
+    for p in range(8765, 8771):
+        try:
+            server = HTTPServer(('127.0.0.1', p), DashboardHandler)
+            port = p
+            break
+        except Exception:
+            pass
+            
+    if not server:
+        sys.stderr.write("[LDP] Dashboard server failed to bind to any port in 8765-8770\n")
+        return
+        
     try:
-        server = HTTPServer(('127.0.0.1', 8765), DashboardHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        sys.stderr.write("[LDP] Dashboard hosted on http://localhost:8765\n")
-    except Exception as e:
-        sys.stderr.write(f"[LDP] Dashboard server failed to bind: {e}\n")
+        port_file = HOME / ".ldp" / "dashboard_port"
+        port_file.parent.mkdir(parents=True, exist_ok=True)
+        port_file.write_text(str(port))
+    except Exception:
+        pass
+        
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    sys.stderr.write(f"[LDP] Dashboard hosted on http://localhost:{port}\n")
 
 def main():
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")

@@ -83,11 +83,46 @@ async function prompt(msg: string): Promise<string> {
 }
 
 async function dashboard() {
-  console.log("\n  \x1b[1mOpening LDP Desktop Dashboard\x1b[0m");
-  console.log("  If browser doesn't open, visit: \x1b[36mhttp://localhost:8765\x1b[0m\n");
-  const { exec } = await import("child_process");
-  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-  exec(`${cmd} http://localhost:8765`);
+  const fs = await import("fs");
+  const path = await import("path");
+  const { exec, spawn } = await import("child_process");
+  
+  const ldpDir = path.join(process.env.HOME || process.env.USERPROFILE || "", ".ldp");
+  const portFile = path.join(ldpDir, "dashboard_port");
+  let port = 8765;
+  
+  // Try to check if server is running by hitting /api/connectors
+  const isRunning = await new Promise(resolve => {
+    let p = 8765;
+    if (fs.existsSync(portFile)) {
+      try { p = parseInt(fs.readFileSync(portFile, "utf-8").trim(), 10) || 8765; } catch (e) {}
+    }
+    const req = require("http").get(`http://localhost:${p}/api/connectors`, (res: any) => {
+        port = p;
+        resolve(true);
+    });
+    req.on("error", () => resolve(false));
+  });
+
+  if (!isRunning) {
+    console.log("  \x1b[90mStarting LDP background daemon...\x1b[0m");
+    const scriptPath = path.join(__dirname, "..", "..", "..", "ldp_server.py");
+    const child = spawn("python3", [scriptPath], { detached: true, stdio: 'ignore' });
+    child.unref();
+    
+    // wait a moment for it to write the port file
+    await new Promise(r => setTimeout(r, 1000));
+    if (fs.existsSync(portFile)) {
+      try { port = parseInt(fs.readFileSync(portFile, "utf-8").trim(), 10) || 8765; } catch (e) {}
+    }
+  }
+
+  console.log(`\n  \x1b[1mOpening LDP Desktop Dashboard\x1b[0m`);
+  console.log(`  Running on port: \x1b[33m${port}\x1b[0m`);
+  console.log(`  If browser doesn't open, visit: \x1b[36mhttp://localhost:${port}\x1b[0m\n`);
+  
+  const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  exec(`${openCmd} http://localhost:${port}`);
 }
 
 async function main() {

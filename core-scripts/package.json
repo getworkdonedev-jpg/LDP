@@ -53,8 +53,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && tsc -p tsconfig.types.json",
-    "build:watch": "tsc -p tsconfig.esm.json --watch",
+    "build": "tsc -p tsconfig.sdk.json",
+    "build:watch": "tsc -p tsconfig.sdk.json --watch",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "lint": "eslint src/",
     "prepublishOnly": "npm run build && npm test"
