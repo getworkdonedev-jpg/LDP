@@ -18,6 +18,84 @@ CORE_SCRIPTS = SCRIPT_DIR / "../core-scripts"
 if not CORE_SCRIPTS.exists():
     CORE_SCRIPTS = SCRIPT_DIR / "core-scripts"
 
+import importlib.abc
+import hashlib
+import logging
+from collections import deque
+
+# --- Layer 2: Secure Network Sandbox ---
+class NetworkSandboxFinder(importlib.abc.MetaPathFinder):
+    BLOCKED_MODULES = {"requests", "urllib", "httpx", "http", "socket", "urllib3"}
+    def find_spec(self, fullname, path, target=None):
+        base_module = fullname.split(".")[0]
+        if base_module in self.BLOCKED_MODULES:
+            raise ImportError(f"LDP Network Sandbox Violation: Attempted to import '{fullname}'")
+        return None
+
+sys.meta_path.insert(0, NetworkSandboxFinder())
+
+# --- Layers 1, 3, 5: Security Enforcer ---
+AUDIT_LOG_FILE = HOME / ".ldp" / "audit.log"
+TRUSTED_FILE = HOME / ".ldp" / "trusted.json"
+
+class LDPSecurityEnforcer:
+    def __init__(self):
+        self.call_history = deque()
+        self.rate_limit = 50
+        self.rate_window = 60 # seconds
+        self._setup_audit_log()
+        self._load_trusted()
+
+    def _setup_audit_log(self):
+        AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            filename=str(AUDIT_LOG_FILE),
+            level=logging.INFO,
+            format='%(asctime)s | LDP_AUDIT | %(message)s'
+        )
+
+    def _load_trusted(self):
+        if not TRUSTED_FILE.exists():
+            TRUSTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(TRUSTED_FILE, "w") as f:
+                    json.dump({"trusted_connectors": [], "policy": "allowlist_only"}, f, indent=2)
+            except: pass
+
+    def verify_connector(self, script_path: Path) -> bool:
+        """Layer 1 & 3: Verifies SHA256 hash of a script against trusted.json."""
+        if not script_path.exists(): return False
+        with open(script_path, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        
+        try:
+            with open(TRUSTED_FILE, "r") as f:
+                trusted = json.load(f)
+        except: return False
+        
+        for c in trusted.get("trusted_connectors", []):
+            if c.get("hash") == f"sha256:{h}":
+                return True
+        logging.warning(f"UNTRUSTED_CONNECTOR | {script_path.name} | hash: sha256:{h}")
+        return False
+
+    def log_call(self, tool_name: str, args: dict):
+        """Layer 5: Logs call and applies 50 per 60s rate limit."""
+        now = datetime.now(timezone.utc).timestamp()
+        
+        threshold = now - self.rate_window
+        while self.call_history and self.call_history[0] < threshold:
+            self.call_history.popleft()
+            
+        if len(self.call_history) >= self.rate_limit:
+            logging.error(f"RATE_LIMIT_EXCEEDED | {tool_name} | dropped")
+            raise Exception("Anomaly Detected: Rate Limit Exceeded (50 calls / 60 sec). LDP paused.")
+            
+        self.call_history.append(now)
+        logging.info(f"TOOL_CALL | {tool_name} | ARGS: {json.dumps(args)}")
+
+security_enforcer = LDPSecurityEnforcer()
+
 DISCOVERED_APPS = {} # AppName -> ConnectionHint/Descriptor
 
 # Platform Detection
@@ -325,6 +403,137 @@ def tool_shell_history(limit: int = 50) -> str:
             except: continue
     return "No shell history found."
 
+def tool_imessage_history(limit: int = 50, query: str = "") -> str:
+    """Read recent iMessage history using Apple's local SQLite database."""
+    db_path = HOME / "Library/Messages/chat.db"
+    if not db_path.exists():
+        return "Error: chat.db not found. Ensure Full Disk Access is granted to your terminal/cursor."
+    
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        shutil.copy2(db_path, tmp_path)
+    except Exception as e:
+        return f"Error copying chat.db: {e}"
+        
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cur = conn.cursor()
+        
+        sql = '''
+            SELECT h.id as sender, m.text, 
+                   datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as date
+            FROM message m
+            LEFT JOIN handle h ON m.handle_id = h.ROWID
+            WHERE m.text IS NOT NULL
+        '''
+        if query: sql += " AND m.text LIKE ?"
+        sql += " ORDER BY m.date DESC LIMIT ?"
+        
+        args = (f"%{query}%", limit) if query else (limit,)
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+        
+        if not rows: return "No messages found."
+            
+        out = ["Recent iMessages:\n"]
+        for sender, text, date in reversed(rows):
+            sender_disp = sender if sender else "Me"
+            snippet = text.replace('\n', ' ')
+            if len(snippet) > 80: snippet = snippet[:77] + "..."
+            out.append(f"[{date}] {sender_disp}: {snippet}")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error querying iMessage: {e}"
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
+
+def tool_contacts_history(query: str = "") -> str:
+    """Search Apple Contacts."""
+    base_dir = HOME / "Library/Application Support/AddressBook/Sources"
+    if not base_dir.exists(): return "Error: Contacts folder not found."
+    
+    results = []
+    for db_path in base_dir.rglob("AddressBook-*.abcddb"):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            shutil.copy2(db_path, tmp_path)
+            conn = sqlite3.connect(tmp_path)
+            cur = conn.cursor()
+            
+            sql = '''
+                SELECT ZABCDRECORD.ZFIRSTNAME, ZABCDRECORD.ZLASTNAME, ZABCDRECORD.ZORGANIZATION,
+                       ZABCDEMAILADDRESS.ZADDRESS, ZABCDPHONENUMBER.ZFULLNUMBER
+                FROM ZABCDRECORD
+                LEFT JOIN ZABCDEMAILADDRESS ON ZABCDEMAILADDRESS.ZOWNER = ZABCDRECORD.Z_PK
+                LEFT JOIN ZABCDPHONENUMBER ON ZABCDPHONENUMBER.ZOWNER = ZABCDRECORD.Z_PK
+                WHERE ZABCDRECORD.ZFIRSTNAME IS NOT NULL OR ZABCDRECORD.ZLASTNAME IS NOT NULL
+            '''
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+            for f, l, o, e, p in rows:
+                name = list(filter(None, [f, l]))
+                name_str = " ".join(name)
+                if query and query.lower() not in name_str.lower() and (not e or query.lower() not in e.lower()):
+                    continue
+                
+                details = []
+                if o: details.append(f"Org: {o}")
+                if e: details.append(f"Email: {e}")
+                if p: details.append(f"Phone: {p}")
+                results.append(f"{name_str} - " + ", ".join(details))
+        except: pass
+        finally:
+            try: os.unlink(tmp_path)
+            except: pass
+            
+    if not results: return "No contacts found."
+    # Deduplicate and sort
+    return "Contacts:\n" + "\n".join(sorted(list(set(results)))[:50])
+
+def tool_calendar_history(limit: int = 50) -> str:
+    """Read recent/upcoming Apple Calendar events."""
+    db_path = HOME / "Library/Calendars/Calendar Cache"
+    if not db_path.exists(): return "Error: Calendar Cache not found."
+        
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        shutil.copy2(db_path, tmp_path)
+    except: return "Error copying calendar db"
+    
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cur = conn.cursor()
+        
+        sql = '''
+            SELECT ZTITLE, 
+                   datetime(ZSTARTDATE + 978307200, 'unixepoch', 'localtime') as start,
+                   datetime(ZENDDATE + 978307200, 'unixepoch', 'localtime') as end,
+                   ZLOCATION
+            FROM ZCALENDARITEM
+            WHERE ZTITLE IS NOT NULL
+            ORDER BY ZSTARTDATE DESC
+            LIMIT ?
+        '''
+        cur.execute(sql, (limit,))
+        rows = cur.fetchall()
+        
+        if not rows: return "No events found."
+        
+        out = ["Calendar Events:\n"]
+        for title, start, end, loc in rows:
+            loc_str = f" at {loc}" if loc else ""
+            out.append(f"[{start} to {end}] {title}{loc_str}")
+        return "\n".join(out)
+    except Exception as e: return f"Error reading Calendar: {e}"
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
+
 def tool_claude_history(limit: int = 20, query: str = "") -> str:
     """Read Claude Desktop local session history and MCP config."""
     claude_dir = HOME / "Library" / "Application Support" / "Claude"
@@ -516,6 +725,87 @@ WALK_SKIP_PATTERNS = [
     "networkserviceproxy", "videosubscriptionsd", "RemoteManagement",
     ".macromedia", "Cookies", "CoreDataBackend", "TipKit", "Dock", "DriveFS"
 ]
+
+import zipfile
+
+def check_for_new_exports():
+    """Layered Integration: Scans ~/Downloads for valid platform exports & unzips them safely."""
+    downloads = HOME / "Downloads"
+    exports_dir = HOME / ".ldp" / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    
+    if not downloads.exists(): return
+    
+    PATTERNS = {
+        "claude": "personal",
+        "instagram": "personal",
+        "takeout": "communication",
+        "twitter": "communication"
+    }
+    
+    count = 0
+    for path in downloads.glob("*.zip"):
+        name = path.stem.lower()
+        matched = None
+        for prefix in PATTERNS.keys():
+            if name.startswith(prefix):
+                matched = prefix
+                break
+                
+        if not matched: continue
+        category = PATTERNS[matched]
+        
+        if approvals.is_denied(category):
+            continue
+            
+        target_dir = exports_dir / name
+        if target_dir.exists():
+            continue # already extracted
+            
+        try:
+            with zipfile.ZipFile(path, 'r') as zip_ref:
+                zip_ref.extractall(target_dir)
+            
+            # Auto-register a query tool for this export
+            tool_name = f"ldp_export_{name.replace('-','_')}_query"
+            if not any(t["name"] == tool_name for t in TOOLS):
+                TOOLS.append({
+                    "name": tool_name,
+                    "description": f"Search exported {matched} data archive.",
+                    "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}
+                })
+                # Dynamic lambda relying on generic export search (to be implemented or falls back)
+                TOOL_MAP[tool_name] = lambda a, t=target_dir: tool_export_search(t, a.get("query",""))
+            count += 1
+        except Exception as e:
+            sys.stderr.write(f"[LDP] Failed to extract {path.name}: {e}\n")
+
+def tool_export_search(export_dir: Path, query: str = "") -> str:
+    """Basic search over extracted JSON/TXT files in an export."""
+    if not query: return "Please provide a query to search this export."
+    results = []
+    
+    # Extremely basic text search over json/txt
+    for filepath in export_dir.rglob("*"):
+        if not filepath.is_file(): continue
+        if filepath.suffix.lower() not in ['.json', '.txt', '.csv', '.html']: continue
+        
+        try:
+            with open(filepath, 'r', errors='ignore') as f:
+                content = f.read()
+                if query.lower() in content.lower():
+                    # context snippet
+                    idx = content.lower().find(query.lower())
+                    start = max(0, idx - 40)
+                    end = min(len(content), idx + 80)
+                    snippet = content[start:end].replace('\n', ' ')
+                    results.append(f"Match in {filepath.name}: ...{snippet}...")
+        except: pass
+        
+        if len(results) > 20: break
+        
+    if not results: return f"No matches found for '{query}' in export."
+    return "\n".join(results)
 
 def tool_discover_apps(at_startup: bool = False) -> str:
     """Walk ALL of ~/Library/Application Support for .sqlite/.db files and register
@@ -805,6 +1095,9 @@ TOOLS = [
     {"name": "ldp_installed_apps", "description": "List all apps in /Applications", "inputSchema": {"type":"object"}},
     {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
     {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
+    {"name": "ldp_imessage_history", "description": "Read local iMessage history", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 50}, "query": {"type":"string"}}}},
+    {"name": "ldp_contacts_history", "description": "Search local Apple Contacts", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
+    {"name": "ldp_calendar_history", "description": "Read local Apple Calendar events", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 50}}}},
     {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
     {"name": "ldp_manage_approvals", "description": "Revoke, reapprove, or reset your LDP category approvals live.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string", "enum": ["revoke", "reapprove", "reset"]}, "category": {"type": "string", "description": "The category (e.g., browser, system, work) for revoke/reapprove"}}}},
 ]
@@ -818,6 +1111,9 @@ TOOL_MAP = {
     "ldp_installed_apps": lambda a: tool_installed_apps(),
     "ldp_chrome_history": lambda a: tool_chrome_history(),
     "ldp_shell_history": lambda a: tool_shell_history(),
+    "ldp_imessage_history": lambda a: tool_imessage_history(a.get("limit", 50), a.get("query", "")),
+    "ldp_contacts_history": lambda a: tool_contacts_history(a.get("query", "")),
+    "ldp_calendar_history": lambda a: tool_calendar_history(a.get("limit", 50)),
     "ldp_claude_history": lambda a: tool_claude_history(a.get("limit", 20), a.get("query", "")),
     "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
 }
@@ -825,10 +1121,30 @@ TOOL_MAP = {
 def main():
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")
     
-    # Run generic category approvals at startup if never asked
     approvals.run_first_run_approvals()
     
-    # Run discovery at startup to populate TOOLS
+    # Static tools auto-filtering based on persistent approvals
+    global TOOLS
+    tools_to_keep = []
+    STATIC_MAP = {
+        "ldp_chrome_history": "browser",
+        "ldp_shell_history": "system",
+        "ldp_claude_history": "personal",
+        "ldp_imessage_history": "communication",
+        "ldp_calendar_history": "personal",
+        "ldp_contacts_history": "communication",
+    }
+    for t in TOOLS:
+        t_name = t["name"]
+        if t_name in STATIC_MAP and approvals.is_denied(STATIC_MAP[t_name]):
+            continue
+        tools_to_keep.append(t)
+    TOOLS[:] = tools_to_keep
+
+    # Run Export Watcher ingestion at startup
+    check_for_new_exports()
+
+    # Run discovery at startup to populate dynamic TOOLS
     tool_discover_apps(at_startup=True)
     
     sys.stderr.write("[LDP] Dynamic Server Ready\n")
@@ -844,10 +1160,14 @@ def main():
                 name = req["params"]["name"]
                 args = req["params"].get("arguments", {})
                 try:
+                    # Layer 5 Security Audit + Rate Limiting
+                    security_enforcer.log_call(name, args)
+                    
                     res = TOOL_MAP[name](args)
                     json.dump({"jsonrpc":"2.0", "id":rid, "result": {"content": [{"type":"text", "text": str(res)}]}}, sys.stdout)
                 except Exception as e:
                     json.dump({"jsonrpc":"2.0", "id":rid, "result": {"content": [{"type":"text", "text": f"Error: {e}"}], "isError": True}}, sys.stdout)
+                print(flush=True)
             sys.stdout.write("\n"); sys.stdout.flush()
         except: pass
 
