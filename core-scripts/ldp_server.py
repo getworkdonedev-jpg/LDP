@@ -1432,8 +1432,9 @@ def start_dashboard_server():
     except Exception:
         pass
         
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    sys.stderr.write(f"[LDP] Dashboard hosted on http://localhost:{port}\n")
+    threading.Thread(target=server.serve_forever, daemon=("--dashboard" not in sys.argv)).start()
+    if "--dashboard" not in sys.argv:
+        sys.stderr.write(f"[LDP] Dashboard hosted on http://127.0.0.1:{port}\n")
 
 def main():
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")
@@ -1450,6 +1451,16 @@ def main():
     
     # Compile the live list of valid apps exposed to AI
     rebuild_tools()
+    
+    if "--dashboard" in sys.argv:
+        try:
+            with open(HOME / ".ldp" / "dashboard_port", "r") as f:
+                port = f.read().strip()
+                sys.stderr.write(f"[LDP] Dashboard hosted on http://127.0.0.1:{port}\n")
+        except: pass
+        sys.stderr.write("[LDP] Running in dedicated dashboard mode (MCP disabled)\n")
+        import time
+        while True: time.sleep(1000)
     
     sys.stderr.write("[LDP] Dynamic Server Ready\n")
     for line in sys.stdin:
