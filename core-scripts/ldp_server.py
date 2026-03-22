@@ -149,14 +149,14 @@ class ApprovalManager:
         return status
 
     def run_first_run_approvals(self):
-        """Check all standard categories and prompt for any that are missing."""
-        changed = False
+        """Check if approvals.json exists. If not, prompt for the 5 categories."""
+        if self.approvals_file.exists():
+            return # RULE 1: If it DOES exist -> skip all dialogs completely
+
+        # If it does NOT exist -> show the 5 approval dialogs once
         for cat in CATEGORY_MAP.keys():
-            if not self.has_asked(cat):
-                self.request(cat, auto_save=False)
-                changed = True
-        if changed:
-            self.save()
+            self.request(cat, auto_save=False)
+        self.save() # Store approvals.json on first run permanently
 
 approvals = ApprovalManager()
 
@@ -514,10 +514,9 @@ def tool_discover_apps(at_startup: bool = False) -> str:
         if approvals.is_denied(category):
             skipped_consent += 1
             continue
-        if not approvals.has_asked(category):
-            if approvals.request(category) == "denied":
-                skipped_consent += 1
-                continue
+        
+        # RULE 2: No on-the-fly prompts ever again. 
+        # If it's not denied, it flows down and auto-registers.
 
         # Register app
         DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "peak_rows": peak}
