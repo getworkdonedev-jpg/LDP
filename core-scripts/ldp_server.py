@@ -444,7 +444,7 @@ WALK_SKIP_PATTERNS = [
     "Service Worker", "Code Cache", "first_party_sets",
     "com.apple.ProtectedCloudStorage", "com.apple.akd",
     "networkserviceproxy", "videosubscriptionsd", "RemoteManagement",
-    ".macromedia", "Cookies",
+    ".macromedia", "Cookies", "CoreDataBackend", "TipKit", "Dock", "DriveFS"
 ]
 
 def tool_discover_apps(at_startup: bool = False) -> str:
