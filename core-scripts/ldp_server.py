@@ -199,6 +199,94 @@ def tool_shell_history(limit: int = 50) -> str:
             except: continue
     return "No shell history found."
 
+def tool_claude_history(limit: int = 20, query: str = "") -> str:
+    """Read Claude Desktop local session history and MCP config."""
+    claude_dir = HOME / "Library" / "Application Support" / "Claude"
+    if not claude_dir.exists():
+        return "Claude Desktop not found on this machine."
+    
+    results: List[Dict] = []
+    
+    # 1. Read agent-mode session files
+    session_glob = str(claude_dir / "local-agent-mode-sessions" / "*" / "*" / ".claude.json")
+    import glob
+    session_files = sorted(glob.glob(session_glob))
+    
+    for sf in session_files:
+        try:
+            p = Path(sf)
+            with open(sf) as f:
+                data = json.load(f)
+            # Extract meaningful session metadata
+            session_id = p.parent.name
+            workspace_id = p.parent.parent.name
+            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
+            first_start = data.get("firstStartTime", "unknown")
+            entry = {
+                "type": "claude_session",
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "first_start": first_start,
+                "last_modified": mtime,
+                "keys": list(data.keys()),
+            }
+            results.append(entry)
+        except: continue
+    
+    # 2. Read MCP config
+    config_path = claude_dir / "claude_desktop_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            mcp_servers = config.get("mcpServers", {})
+            results.append({
+                "type": "mcp_config",
+                "server_count": len(mcp_servers),
+                "servers": list(mcp_servers.keys()),
+                "full_config": config,
+            })
+        except: pass
+    
+    # 3. Read window state
+    ws = claude_dir / "window-state.json"
+    if ws.exists():
+        try:
+            with open(ws) as f:
+                wdata = json.load(f)
+            results.append({"type": "window_state", **wdata})
+        except: pass
+    
+    # Filter by query if provided
+    if query:
+        q = query.lower()
+        results = [r for r in results if any(q in str(v).lower() for v in r.values())]
+    
+    if not results:
+        return "No Claude session data found."
+    
+    # Apply limit
+    limited = results[:limit]
+    
+    out = [f"Claude Desktop Data ({len(results)} items found, showing {len(limited)}):\n"]
+    for r in limited:
+        rtype = r.get("type", "unknown")
+        if rtype == "claude_session":
+            out.append(f"  📝 Session {r['session_id'][:16]}...")
+            out.append(f"     Workspace: {r['workspace_id'][:16]}...")
+            out.append(f"     Started: {r['first_start']}")
+            out.append(f"     Modified: {r['last_modified']}")
+        elif rtype == "mcp_config":
+            out.append(f"  ⚙️  MCP Config: {r['server_count']} servers registered")
+            for s in r["servers"]:
+                out.append(f"       - {s}")
+        elif rtype == "window_state":
+            out.append(f"  🪟 Window: {r}")
+        out.append("")
+    
+    return "\n".join(out)
+
+
 def count_db_rows(db_path: Path) -> int:
     """Count total rows across all tables in a SQLite db using a temp copy."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -532,6 +620,7 @@ TOOLS = [
     {"name": "ldp_installed_apps", "description": "List all apps in /Applications", "inputSchema": {"type":"object"}},
     {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
     {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
+    {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
 ]
 
 TOOL_MAP = {
@@ -543,6 +632,7 @@ TOOL_MAP = {
     "ldp_installed_apps": lambda a: tool_installed_apps(),
     "ldp_chrome_history": lambda a: tool_chrome_history(),
     "ldp_shell_history": lambda a: tool_shell_history(),
+    "ldp_claude_history": lambda a: tool_claude_history(a.get("limit", 20), a.get("query", "")),
 }
 
 def main():
