@@ -91,7 +91,17 @@ class ApprovalManager:
         if self.approvals_file.exists():
             try:
                 with open(self.approvals_file, "r") as f:
-                    self.state = json.load(f)
+                    data = json.load(f)
+                # migrate from old string format
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        data[k] = {
+                            "approved": (v == "approved"),
+                            "asked_at": datetime.now(timezone.utc).isoformat(),
+                            "revoked_at": None,
+                            "can_retry": (v != "approved")
+                        }
+                self.state = data
             except:
                 self.state = {}
 
@@ -104,19 +114,38 @@ class ApprovalManager:
             sys.stderr.write(f"[LDP] Error saving approvals: {e}\n")
 
     def is_approved(self, category: str) -> bool:
-        return self.state.get(category) == "approved"
+        if category not in self.state: return False
+        return self.state[category].get("approved", False)
 
     def is_denied(self, category: str) -> bool:
-        return self.state.get(category) == "denied"
+        if category not in self.state: return False
+        return not self.state[category].get("approved", False)
 
     def has_asked(self, category: str) -> bool:
         return category in self.state
 
+    def reset(self):
+        self.state = {}
+        if self.approvals_file.exists():
+            try: os.unlink(self.approvals_file)
+            except: pass
+
+    def revoke(self, category: str):
+        if category in self.state:
+            self.state[category]["approved"] = False
+            self.state[category]["revoked_at"] = datetime.now(timezone.utc).isoformat()
+            self.state[category]["can_retry"] = True
+            self.save()
+
     def request(self, category: str, auto_save: bool = True) -> str:
         """Prompt user via macOS dialog and store result."""
-        # Only works on macOS for now
         if PLATFORM != "darwin":
-            self.state[category] = "approved"
+            self.state[category] = {
+                "approved": True,
+                "asked_at": datetime.now(timezone.utc).isoformat(),
+                "revoked_at": None,
+                "can_retry": False
+            }
             if auto_save: self.save()
             return "approved"
 
@@ -136,14 +165,16 @@ class ApprovalManager:
         
         try:
             res = subprocess.run(["osascript", "-e", apple_script], capture_output=True, text=True)
-            if "Allow" in res.stdout:
-                status = "approved"
-            else:
-                status = "denied"
+            status = "approved" if "Allow" in res.stdout else "denied"
         except:
-            status = "denied"  # fail closed
+            status = "denied"
 
-        self.state[category] = status
+        self.state[category] = {
+            "approved": (status == "approved"),
+            "asked_at": datetime.now(timezone.utc).isoformat(),
+            "revoked_at": None,
+            "can_retry": (status == "denied")
+        }
         if auto_save:
             self.save()
         return status
@@ -153,10 +184,9 @@ class ApprovalManager:
         if self.approvals_file.exists():
             return # RULE 1: If it DOES exist -> skip all dialogs completely
 
-        # If it does NOT exist -> show the 5 approval dialogs once
         for cat in CATEGORY_MAP.keys():
             self.request(cat, auto_save=False)
-        self.save() # Store approvals.json on first run permanently
+        self.save()
 
 approvals = ApprovalManager()
 
@@ -382,16 +412,56 @@ def tool_claude_history(limit: int = 20, query: str = "") -> str:
     
     return "\n".join(out)
 
-def tool_request_approvals() -> str:
-    """Manually trigger approval requests for any unapproved categories."""
-    count_before = len(TOOLS)
-    for cat in CATEGORY_MAP.keys():
-        if not approvals.is_approved(cat):
-            approvals.request(cat)
-    # Re-run discovery to pick up newly approved apps
-    tool_discover_apps()
-    count_after = len(TOOLS)
-    return f"Approval flow complete. {count_after - count_before} new tools registered."
+def tool_manage_approvals(action: str, category: str = "") -> str:
+    """Manage category approvals."""
+    global TOOLS, DISCOVERED_APPS
+    
+    if action == "reset":
+        approvals.reset()
+        return "Full reset complete. ~/.ldp/approvals.json deleted. Dialogs will reappear on next LDP start."
+        
+    elif action == "revoke":
+        if not category or category not in CATEGORY_MAP: return f"Unknown or missing category: {category}"
+        approvals.revoke(category)
+        
+        # Live unregister dynamic tools
+        for name_key in list(DISCOVERED_APPS.keys()):
+            if classify_app(name_key) == category:
+                del DISCOVERED_APPS[name_key]
+                
+        # Rebuild TOOLS list excluding the revoked category
+        tools_to_keep = []
+        STATIC_MAP = {
+            "ldp_chrome_history": "browser",
+            "ldp_shell_history": "system",
+            "ldp_claude_history": "personal",
+        }
+        for t in TOOLS:
+            name = t["name"]
+            if name in STATIC_MAP and STATIC_MAP[name] == category:
+                continue # drop static tool from this category
+            if name.startswith("ldp_") and name.endswith("_query"):
+                name_key = name[4:-6]
+                if classify_app(name_key) == category:
+                    continue # drop dynamic tool from this category
+            tools_to_keep.append(t)
+            
+        removed_count = len(TOOLS) - len(tools_to_keep)
+        TOOLS[:] = tools_to_keep # in-place modification
+        return f"Revoked '{category}'. {removed_count} tools instantly unregistered."
+        
+    elif action == "reapprove":
+        if not category or category not in CATEGORY_MAP: return f"Unknown or missing category: {category}"
+        if approvals.is_approved(category):
+            return f"Category '{category}' is already approved."
+        
+        status = approvals.request(category)
+        if status == "approved":
+            tool_discover_apps() # Run discovery to instantly register
+            return f"Re-approved '{category}'. Tools instantly registered."
+        return f"Re-approval for '{category}' was denied."
+
+    return "Invalid action. Use reset, revoke, or reapprove."
 
 def count_db_rows(db_path: Path) -> int:
     """Count total rows across all tables in a SQLite db using a temp copy."""
@@ -736,7 +806,7 @@ TOOLS = [
     {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
     {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
     {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
-    {"name": "ldp_request_approvals", "description": "Re-prompt for access to any denied app categories.", "inputSchema": {"type":"object"}},
+    {"name": "ldp_manage_approvals", "description": "Revoke, reapprove, or reset your LDP category approvals live.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string", "enum": ["revoke", "reapprove", "reset"]}, "category": {"type": "string", "description": "The category (e.g., browser, system, work) for revoke/reapprove"}}}},
 ]
 
 TOOL_MAP = {
@@ -749,7 +819,7 @@ TOOL_MAP = {
     "ldp_chrome_history": lambda a: tool_chrome_history(),
     "ldp_shell_history": lambda a: tool_shell_history(),
     "ldp_claude_history": lambda a: tool_claude_history(a.get("limit", 20), a.get("query", "")),
-    "ldp_request_approvals": lambda a: tool_request_approvals(),
+    "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
 }
 
 def main():
