@@ -2,6 +2,9 @@
  * LDP Crypto — AES-256-GCM
  * Key derived from machine ID via PBKDF2. Never stored in plaintext.
  * All LDP data at rest is encrypted through this module.
+ *
+ * FIX CRITICAL-03: hashDescriptor now uses deepSort() for fully
+ * deterministic canonical JSON across all Node.js versions.
  */
 
 import * as crypto from "node:crypto";
@@ -22,7 +25,7 @@ function machineId(): Buffer {
     if (process.platform === "darwin") {
       try {
         const { execSync } = require("child_process");
-        const out   = execSync("ioreg -rd1 -c IOPlatformExpertDevice", { encoding: "utf8" }) as string;
+        const out   = execSync("ioreg -rd1 -c IOPlatformExpertDevice", { encoding: "utf8" });
         const match = out.match(/IOPlatformUUID[^=]+=\s*"([^"]+)"/);
         if (match) return Buffer.from(match[1]);
       } catch { /* fallback */ }
@@ -72,22 +75,17 @@ export class LDPCrypto {
 
   /** Decrypt base64 ciphertext. Throws if tampered. */
   decrypt(blob: string): string {
-    const raw     = Buffer.from(blob, "base64");
-    const nonce   = raw.subarray(0, 12);
-    const tag     = raw.subarray(12, 28);
-    const ct      = raw.subarray(28);
+    const raw      = Buffer.from(blob, "base64");
+    const nonce    = raw.subarray(0, 12);
+    const tag      = raw.subarray(12, 28);
+    const ct       = raw.subarray(28);
     const decipher = crypto.createDecipheriv("aes-256-gcm", this.key, nonce);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
   }
 
-  encryptJson(obj: unknown): string {
-    return this.encrypt(JSON.stringify(obj));
-  }
-
-  decryptJson<T = unknown>(blob: string): T {
-    return JSON.parse(this.decrypt(blob)) as T;
-  }
+  encryptJson(obj: unknown): string       { return this.encrypt(JSON.stringify(obj)); }
+  decryptJson<T = unknown>(blob: string): T { return JSON.parse(this.decrypt(blob)) as T; }
 
   writeEncrypted(filePath: string, obj: unknown): void {
     const dir = path.dirname(filePath);
@@ -101,11 +99,40 @@ export class LDPCrypto {
     catch { return {} as T; }
   }
 
-  /** SHA-256 fingerprint of a connector descriptor. Used for consent verification. */
+  /**
+   * SHA-256 fingerprint of a connector descriptor.
+   *
+   * FIX CRITICAL-03: original used Object.keys(obj).sort() which only
+   * sorted top-level keys. Nested objects retained insertion order,
+   * making fingerprints non-deterministic across Node versions.
+   *
+   * Fix: deepSort() recursively sorts all object keys before
+   * JSON.stringify(), guaranteeing identical output regardless of
+   * key insertion order at any nesting depth.
+   */
   hashDescriptor(obj: object): string {
-    const canonical = JSON.stringify(obj, Object.keys(obj as object).sort());
+    const canonical = JSON.stringify(deepSort(obj));
     return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 16);
   }
+}
+
+/**
+ * Recursively sort all object keys alphabetically.
+ * Arrays preserve order (order is meaningful in arrays).
+ * Primitives pass through unchanged.
+ */
+function deepSort(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(deepSort);
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as object).sort()) {
+      sorted[key] = deepSort((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
 }
 
 let _instance: LDPCrypto | null = null;

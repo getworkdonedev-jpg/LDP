@@ -1,4 +1,4 @@
-import { SignalConnector } from "./signal.ts";
+import { SignalConnector } from "./signal.js";
 
 async function runSignal() {
   console.log("Testing Signal Connector...\n");

@@ -133,6 +133,37 @@ const KNOWN_FINGERPRINTS = [
             recent_edits: "Contacts modified recently",
         },
     },
+    {
+        pattern: /Messages.*chat\.db/i,
+        app: "iMessage",
+        category: "messaging",
+        permissions: ["messages.read"],
+        namedQueries: {
+            recent_messages: "Last 50 text messages with sender names",
+            top_chats: "Most active message threads",
+            attachments: "Files and images shared via iMessage",
+        },
+    },
+    {
+        pattern: /com\.apple\.notes.*NoteStore\.sqlite/i,
+        app: "Apple Notes",
+        category: "notes",
+        permissions: ["notes.read"],
+        namedQueries: {
+            all_notes: "Title and preview of all notes",
+            folders: "List of note folders/categories",
+            recent_notes: "Notes modified in last 7 days",
+        },
+    },
+    {
+        pattern: /Stickies\.sqlite/i,
+        app: "Stickies",
+        category: "notes",
+        permissions: ["notes.read"],
+        namedQueries: {
+            all_stickies: "Content of all desktop sticky notes",
+        },
+    },
 ];
 // ── Default scan paths per platform ──────────────────────────────────────────
 function defaultScanPaths() {
@@ -144,6 +175,8 @@ function defaultScanPaths() {
             path.join(home, "Library", "Containers"),
             path.join(home, "Library", "Group Containers"),
             path.join(home, "Library", "Messages"),
+            path.join(home, "Library", "Stickies"),
+            path.join(home, "Library", "Notes"),
             path.join(home, "Library", "Mail"),
             path.join(home, "Documents"),
             path.join(home, "Downloads"),
@@ -339,31 +372,49 @@ Rules:
 function buildConnector(descriptor, sourcePath) {
     return {
         descriptor,
-        async discover() { return true; },
+        async discover() { return fs.existsSync(sourcePath); },
         async schema() {
             return {};
         },
-        async read(query) {
-            // For now returns schema + path info as rows.
-            // When better-sqlite3 is available this becomes a real query.
+        async read(query, limit = 100) {
             const schema = readSQLiteSchema(sourcePath);
             if (!schema)
                 return [];
             const queryLower = query.toLowerCase();
-            // Match query to named query keys to filter tables
+            // Match query to known tables or pick the first significant one
             const matchedTable = schema.tables.find(t => queryLower.includes(t.name.toLowerCase()) ||
-                Object.keys(descriptor.namedQueries).some(k => queryLower.includes(k.replace(/_/g, " ")))) ?? schema.tables[0];
+                Object.keys(descriptor.namedQueries).some(k => queryLower.includes(k.replace(/_/g, " ")))) ?? schema.tables.find(t => t.rowCount > 0) ?? schema.tables[0];
             if (!matchedTable)
                 return [];
-            // Return schema rows as descriptive data (real SQL when native deps available)
-            return matchedTable.columns.map((col, i) => ({
-                id: i,
-                table: matchedTable.name,
-                column: col.name,
-                type: col.type,
-                source: descriptor.name,
-                note: `Real data requires: npm install better-sqlite3`,
-            }));
+            // Dynamic SQL execution via better-sqlite3 (real data!)
+            try {
+                const Database = (await import("better-sqlite3")).default;
+                // Copy to tmp to avoid locking real app databases
+                const tmp = path.join(os.tmpdir(), `ldp_auto_${Date.now()}.db`);
+                fs.copyFileSync(sourcePath, tmp);
+                const db = new Database(tmp, { readonly: true });
+                const cols = matchedTable.columns.map(c => c.name).join(", ");
+                const sql = `SELECT ${cols} FROM "${matchedTable.name}" LIMIT ${limit}`;
+                const rows = db.prepare(sql).all();
+                db.close();
+                try {
+                    fs.unlinkSync(tmp);
+                }
+                catch { }
+                return rows.map(r => ({ ...r, _src: descriptor.name }));
+            }
+            catch (err) {
+                console.warn(`[LDP AutoGen] Failed to read ${sourcePath}:`, err.message);
+                // Fallback to schema info if SQL fails (e.g. encrypted or locked)
+                return matchedTable.columns.map((col, i) => ({
+                    id: i,
+                    table: matchedTable.name,
+                    column: col.name,
+                    type: col.type,
+                    _src: descriptor.name,
+                    _note: "Could not read real data (encrypted or locked)"
+                }));
+            }
         },
     };
 }
@@ -640,3 +691,4 @@ export async function autoGenCLI(apiKey, jsonMode = false) {
     }
     return results;
 }
+//# sourceMappingURL=auto-connector.js.map

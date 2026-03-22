@@ -2,6 +2,14 @@
  * LDP Chrome Connector
  * Reads real Chrome SQLite history on macOS / Linux / Windows.
  * SyntheticChromeConnector for testing without a real browser.
+ *
+ * FIX CRITICAL-01: chromeTimeToUnix now validates input bounds.
+ * Chrome stores timestamps as microseconds since 1601-01-01.
+ * The original had no guard: values near Number.MAX_SAFE_INTEGER
+ * produced Infinity or NaN after division, breaking date formatting.
+ *
+ * Fix: clamp t to a sane range before conversion.
+ * Valid Chrome timestamps are between ~1970 and ~2100 in Unix time.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -34,9 +42,21 @@ const CHROME_SCHEMA = {
         transition: "typed / link / redirect / bookmark",
     },
 };
+// ── FIX CRITICAL-01 ───────────────────────────────────────────────────────────
+// Chrome epoch offset: seconds between 1601-01-01 and 1970-01-01
+const CHROME_EPOCH_OFFSET = 11_644_473_600;
+// Smallest valid Chrome timestamp  (~1970-01-01 in Chrome epoch, microseconds)
+const CHROME_TS_MIN = CHROME_EPOCH_OFFSET * 1_000_000;
+// Largest valid Chrome timestamp   (~2100-01-01 in Chrome epoch, microseconds)
+const CHROME_TS_MAX = (CHROME_EPOCH_OFFSET + 4_102_444_800) * 1_000_000;
 function chromeTimeToUnix(t) {
-    return t > 0 ? t / 1_000_000 - 11_644_473_600 : 0;
+    if (!Number.isFinite(t) || t <= 0)
+        return 0;
+    if (t < CHROME_TS_MIN || t > CHROME_TS_MAX)
+        return 0; // out of sane range
+    return t / 1_000_000 - CHROME_EPOCH_OFFSET;
 }
+// ─────────────────────────────────────────────────────────────────────────────
 export class ChromeConnector {
     descriptor = {
         name: "chrome",
@@ -48,7 +68,7 @@ export class ChromeConnector {
             top_sites: "Most visited sites",
             recent: "Last 100 pages visited",
             searches: "Search queries entered",
-            distractions: "Distracting sites (YouTube, Reddit, Twitter)",
+            distractions: "Instagram, YouTube, Reddit, TikTok",
         },
         description: "Chrome browsing history — stays on your device.",
     };
@@ -57,9 +77,7 @@ export class ChromeConnector {
         this.dbPath = findFirst(this.descriptor.dataPaths);
         return this.dbPath !== null;
     }
-    async schema() {
-        return CHROME_SCHEMA;
-    }
+    async schema() { return CHROME_SCHEMA; }
     async read(query, limit = 500) {
         if (!this.dbPath)
             return [];
@@ -68,6 +86,7 @@ export class ChromeConnector {
         try {
             fs.copyFileSync(this.dbPath, tmp);
             const db = new Database(tmp, { readonly: true });
+            // Register the fixed converter as a SQLite scalar function
             db.function("ctu", (t) => chromeTimeToUnix(t));
             const q = query.toLowerCase();
             let sql;
@@ -81,7 +100,7 @@ export class ChromeConnector {
                 sql = `${base} ORDER BY visit_count DESC LIMIT ${limit}`;
             }
             else if (/waste|distract|youtube|reddit|social/.test(q)) {
-                sql = `${base} AND (url LIKE '%youtube%' OR url LIKE '%reddit%' OR url LIKE '%twitter%' OR url LIKE '%netflix%') ORDER BY visit_count DESC LIMIT ${limit}`;
+                sql = `${base} AND (url LIKE '%youtube%' OR url LIKE '%reddit%' OR url LIKE '%twitter%' OR url LIKE '%instagram%' OR url LIKE '%tiktok%' OR url LIKE '%netflix%') ORDER BY visit_count DESC LIMIT ${limit}`;
             }
             else {
                 sql = `${base} ORDER BY last_visit_time DESC LIMIT ${limit}`;
@@ -94,7 +113,7 @@ export class ChromeConnector {
                 _recency: Math.max(0, 1 - (now - new Date(r.last_visit).getTime() / 1000) / (30 * 86400)),
             }));
         }
-        catch (e) {
+        catch {
             return [];
         }
         finally {
@@ -116,6 +135,8 @@ const SYNTH_SITES = [
     ["anthropic.com", "Anthropic", 55, "work"],
     ["google.com/search?q=ldp", "LDP - Google", 40, "search"],
     ["netflix.com", "Netflix", 85, "distract"],
+    ["instagram.com", "Instagram", 95, "social"],
+    ["tiktok.com", "TikTok", 70, "distract"],
     ["localhost:3000", "Local Dev", 110, "work"],
 ];
 export class SyntheticChromeConnector {
@@ -126,14 +147,20 @@ export class SyntheticChromeConnector {
     };
     rows;
     constructor() {
+        /**
+         * FIX MEDIUM-09: use a seeded deterministic LCG (linear congruential
+         * generator) instead of Math.random(). Synthetic connectors now produce
+         * stable, reproducible data across runs, making tests reliable.
+         */
+        const rng = makeLCG(42);
         const now = Date.now() / 1000;
         this.rows = SYNTH_SITES.map(([url, title, visits, cat]) => ({
             url: `https://${url}`,
             title,
-            visit_count: visits + Math.floor(Math.random() * 40 - 20),
-            last_visit: new Date((now - Math.random() * 7 * 86400) * 1000)
+            visit_count: visits + Math.floor(rng() * 40 - 20),
+            last_visit: new Date((now - rng() * 7 * 86400) * 1000)
                 .toISOString().slice(0, 19).replace("T", " "),
-            _recency: Math.random() * 0.7 + 0.3,
+            _recency: rng() * 0.7 + 0.3,
             _category: cat,
         }));
     }
@@ -153,3 +180,16 @@ export class SyntheticChromeConnector {
         return rows.slice(0, limit);
     }
 }
+/**
+ * FIX MEDIUM-09: seeded deterministic LCG.
+ * Returns a function that produces the same sequence on every run.
+ * Constants from Numerical Recipes (Knuth).
+ */
+function makeLCG(seed) {
+    let s = seed >>> 0;
+    return () => {
+        s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+        return s / 0x100000000;
+    };
+}
+//# sourceMappingURL=chrome.js.map

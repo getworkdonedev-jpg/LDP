@@ -1,4 +1,4 @@
-import { autoGenCLI } from "./auto-connector.ts";
+import { autoGenCLI } from "./auto-connector.js";
 async function main() {
     await autoGenCLI();
 }

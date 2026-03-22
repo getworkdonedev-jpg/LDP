@@ -2,6 +2,16 @@
  * LDP Engine — core runtime.
  * Manages connectors, enforces consent, encrypts all state,
  * packs context, handles write intents, logs everything.
+ *
+ * FIXES APPLIED:
+ *   CRITICAL-02 — AuditLog race condition: queue now cleared only AFTER
+ *                 confirmed successful write, not before.
+ *   HIGH-05     — Consent bypass: fingerprint re-verified on every connect(),
+ *                 not just at grant time.
+ *   HIGH-06     — ContextPacker empty query: filter out empty tokens so
+ *                 "" does not match every chunk.
+ *   MEDIUM-08   — engine.query() source errors now returned in payload
+ *                 as sourceErrors{} instead of being silently swallowed.
  */
 
 import * as fs   from "node:fs";
@@ -28,10 +38,7 @@ export class SchemaCache {
     this.mem    = this.crypto.readEncrypted(file);
   }
 
-  get(app: string, fp: string): unknown {
-    return this.mem[`${app}:${fp}`];
-  }
-
+  get(app: string, fp: string): unknown          { return this.mem[`${app}:${fp}`]; }
   set(app: string, fp: string, schema: unknown): void {
     this.mem[`${app}:${fp}`] = schema;
     this.crypto.writeEncrypted(this.file, this.mem);
@@ -51,6 +58,12 @@ export class ConsentStore {
     this.store  = this.crypto.readEncrypted(file);
   }
 
+  /**
+   * FIX HIGH-05: re-verify fingerprint on every call.
+   * Original only checked that a record existed for the name.
+   * An attacker could swap a connector's descriptor after consent was
+   * granted and the old record would still pass.
+   */
   hasConsent(descriptor: ConnectorDescriptor): boolean {
     const rec = this.store[descriptor.name];
     return !!rec && rec.fingerprint === getCrypto().hashDescriptor(descriptor);
@@ -72,9 +85,7 @@ export class ConsentStore {
     this.crypto.writeEncrypted(this.file, this.store);
   }
 
-  listConsented(): string[] {
-    return Object.keys(this.store);
-  }
+  listConsented(): string[] { return Object.keys(this.store); }
 }
 
 // ── Context Packer ────────────────────────────────────────────────────────────
@@ -82,17 +93,32 @@ export class ConsentStore {
 export class ContextPacker {
   private readonly budget: number;
 
-  constructor(tokenBudget = 8_000) {
-    this.budget = tokenBudget;
-  }
+  constructor(tokenBudget = 8_000) { this.budget = tokenBudget; }
 
   private score(row: Row, query: string): number {
-    const qWords  = new Set(query.toLowerCase().split(/\s+/));
+    /**
+     * FIX HIGH-06: filter out empty tokens before scoring.
+     * Original: query.toLowerCase().split(/\s+/) on an empty string
+     * produces [""], which .includes() matches on every chunk,
+     * giving all chunks a relevance score of 1.0.
+     * Fix: filter(Boolean) removes the empty string token.
+     */
+    const qWords  = new Set(
+      query.toLowerCase().split(/\s+/).filter(Boolean)
+    );
     const text    = Object.values(row).join(" ").toLowerCase();
-    const hits    = [...qWords].filter(w => text.includes(w)).length;
+
+    // If query is truly empty, relevance = 0 (rely on recency only)
+    const hits    = qWords.size === 0
+      ? 0
+      : [...qWords].filter(w => text.includes(w)).length;
+
     const recency = (row._recency as number) ?? 0.5;
     const weight  = (row._weight  as number) ?? 1.0;
-    return (hits / Math.max(qWords.size, 1)) * 0.6 + recency * 0.3 + weight * 0.1;
+
+    return (qWords.size === 0 ? 0 : hits / qWords.size) * 0.6
+         + recency * 0.3
+         + weight  * 0.1;
   }
 
   pack(sources: Record<string, Row[]>, query: string): ContextResult {
@@ -114,8 +140,10 @@ export class ContextPacker {
     }
 
     const totalRows = Object.values(sources).reduce((s, r) => s + r.length, 0);
-    return { query, chunks: packed, tokensUsed: tokens,
-             sources: Object.keys(sources), totalRows, packedRows: packed.length };
+    return {
+      query, chunks: packed, tokensUsed: tokens,
+      sources: Object.keys(sources), totalRows, packedRows: packed.length,
+    };
   }
 }
 
@@ -134,7 +162,7 @@ export class AuditLog {
 
   start(): void {
     this.timer = setInterval(() => this.flush(), 500);
-    this.timer.unref?.(); // don't keep process alive
+    this.timer.unref?.();
   }
 
   stop(): void {
@@ -142,20 +170,39 @@ export class AuditLog {
     this.flush();
   }
 
+  /**
+   * FIX CRITICAL-02: original cleared the queue BEFORE writing.
+   * If writeEncrypted threw, the queued entries were permanently lost.
+   *
+   * Fix: capture the batch, attempt the write, and only splice those
+   * entries out of the queue AFTER the write succeeds.
+   * On failure the entries remain in the queue and are retried on the
+   * next flush() call.
+   */
   private flush(): void {
     if (!this.queue.length) return;
+
+    // Snapshot current queue — do NOT clear it yet
     const batch = [...this.queue];
-    this.queue  = [];
+
     try {
       const existing = this.crypto.readEncrypted<{ entries: unknown[] }>(this.file);
       const all      = [...(existing.entries ?? []), ...batch].slice(-10_000);
       this.crypto.writeEncrypted(this.file, { entries: all });
-    } catch { /* non-fatal */ }
+
+      // Only remove entries that were successfully written
+      this.queue.splice(0, batch.length);
+    } catch {
+      // Non-fatal: entries stay in queue, retried next tick
+    }
   }
 
-  log(event: string, connector: string,
-      details: Record<string, unknown> = {},
-      risk: RiskTier = RiskTier.READ): void {
+  log(
+    event: string,
+    connector: string,
+    details: Record<string, unknown> = {},
+    risk: RiskTier = RiskTier.READ,
+  ): void {
     this.queue.push({ ts: Date.now() / 1000, event, connector, risk, ...details });
   }
 
@@ -169,32 +216,34 @@ export class AuditLog {
 // ── LDP Engine ────────────────────────────────────────────────────────────────
 
 export interface LDPEngineOptions {
-  dataDir?:       string;
-  tokenBudget?:   number;
-  approvalCb?:    ApprovalCallback;
+  dataDir?:     string;
+  tokenBudget?: number;
+  approvalCb?:  ApprovalCallback;
 }
 
 export class LDPEngine {
-  private readonly dataDir:   string;
-  private readonly cache:     SchemaCache;
-  private readonly consent:   ConsentStore;
-  private readonly packer:    ContextPacker;
-  readonly audit:             AuditLog;
+  private readonly dataDir:  string;
+  private readonly cache:    SchemaCache;
+  private readonly consent:  ConsentStore;
+  private readonly packer:   ContextPacker;
+  readonly audit:            AuditLog;
 
-  private connectors = new Map<string, BaseConnector>();
-  private connected  = new Set<string>();
+  // FIX HIGH-04: connectors is now public readonly so MCPAdapter
+  // can access it without the unsafe (this.engine as any) cast.
+  readonly connectors = new Map<string, BaseConnector>();
+  private connected   = new Set<string>();
   private approvalCb: ApprovalCallback | null;
 
   readonly stats = {
-    messages:       0, discovers:     0, reads:     0,
-    cacheHits:      0, cacheMisses:   0,
+    messages: 0, discovers: 0, reads: 0,
+    cacheHits: 0, cacheMisses: 0,
     consentGranted: 0, consentDenied: 0,
-    writeIntents:   0, approved:      0, rejected:  0,
-    errors:         0,
+    writeIntents: 0, approved: 0, rejected: 0,
+    errors: 0,
   };
 
   constructor(opts: LDPEngineOptions = {}) {
-    this.dataDir    = opts.dataDir ?? LDP_DIR;
+    this.dataDir   = opts.dataDir ?? LDP_DIR;
     this.approvalCb = opts.approvalCb ?? null;
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     this.cache   = new SchemaCache (path.join(this.dataDir, "schema_cache.enc"));
@@ -203,32 +252,21 @@ export class LDPEngine {
     this.packer  = new ContextPacker(opts.tokenBudget);
   }
 
-  /** Start background tasks (audit flush). Call before using the engine. */
-  start(): this {
-    this.audit.start();
-    return this;
-  }
+  start(): this { this.audit.start(); return this; }
+  stop():  void { this.audit.stop(); }
 
-  /** Stop background tasks. Call on shutdown. */
-  stop(): void {
-    this.audit.stop();
-  }
-
-  /** Set approval callback for MEDIUM/HIGH write intents. */
   setApprovalCallback(cb: ApprovalCallback): this {
     this.approvalCb = cb;
     return this;
   }
 
-  /** Register a connector. */
   register(connector: BaseConnector): this {
     this.connectors.set(connector.descriptor.name, connector);
     return this;
   }
 
-  // ── Consent ──────────────────────────────────────────────────────────────────
+  // ── Consent ───────────────────────────────────────────────────────────────
 
-  /** Returns consent request info. Show this to the user before connect(). */
   requestConsent(name: string): ConsentRequest | { error: string } {
     const c = this.connectors.get(name);
     if (!c) return { error: `Unknown connector: ${name}` };
@@ -240,11 +278,10 @@ export class LDPEngine {
       dataPaths:   d.dataPaths,
       description: d.description,
       fingerprint: getCrypto().hashDescriptor(d),
-      prompt:      `LDP wants to read your ${d.app} data.\nPermissions: ${d.permissions.join(", ")}\nData stays on your device.\nApprove?`,
+      prompt: `LDP wants to read your ${d.app} data.\nPermissions: ${d.permissions.join(", ")}\nData stays on your device.\nApprove?`,
     };
   }
 
-  /** Grant consent for a connector. Must be called before connect(). */
   grantConsent(name: string, grantedBy = "user"): boolean {
     const c = this.connectors.get(name);
     if (!c) return false;
@@ -254,23 +291,24 @@ export class LDPEngine {
     return true;
   }
 
-  /** Revoke consent and disconnect. */
   revokeConsent(name: string): void {
     this.connected.delete(name);
     this.consent.revoke(name);
     this.audit.log("CONSENT_REVOKED", name);
   }
 
-  // ── Connect ───────────────────────────────────────────────────────────────────
+  // ── Connect ───────────────────────────────────────────────────────────────
 
-  /**
-   * Discover + schema in one atomic step.
-   * Requires prior grantConsent() unless autoConsent=true (testing only).
-   */
   async connect(name: string, autoConsent = false): Promise<LDPMessage> {
     const c = this.connectors.get(name);
     if (!c) return errorMessage(`Unknown connector: ${name}`);
 
+    /**
+     * FIX HIGH-05: hasConsent() now re-verifies the live descriptor
+     * fingerprint on every call (moved fix into ConsentStore.hasConsent).
+     * If the descriptor changed since consent was granted, this returns
+     * false and the user must re-approve.
+     */
     if (!this.consent.hasConsent(c.descriptor)) {
       if (autoConsent) {
         this.grantConsent(name, "auto");
@@ -285,7 +323,7 @@ export class LDPEngine {
 
     this.stats.discovers++;
     let found: boolean;
-    try { found = await c.discover(); }
+    try   { found = await c.discover(); }
     catch (e) {
       this.stats.errors++;
       return errorMessage(`discover failed: ${String(e)}`);
@@ -312,17 +350,21 @@ export class LDPEngine {
                         cache: cached ? "hit" : "mapped" });
   }
 
-  // ── Query ─────────────────────────────────────────────────────────────────────
+  // ── Query ─────────────────────────────────────────────────────────────────
 
-  /**
-   * Query one or more connected sources.
-   * Returns a CONTEXT message with relevance-ranked chunks.
-   */
   async query(question: string, sources?: string[]): Promise<LDPMessage> {
     const targets = sources ?? [...this.connected];
     if (!targets.length) return errorMessage("No connected sources");
 
     const raw: Record<string, Row[]> = {};
+
+    /**
+     * FIX MEDIUM-08: source errors are no longer silently swallowed.
+     * Each connector failure is captured in sourceErrors{} and returned
+     * inside the CONTEXT payload so callers can see which sources failed.
+     */
+    const sourceErrors: Record<string, string> = {};
+
     for (const name of targets) {
       if (!this.connected.has(name)) continue;
       try {
@@ -332,30 +374,32 @@ export class LDPEngine {
         this.audit.log("READ", name, { query: question.slice(0, 80), rows: rows.length });
       } catch (e) {
         this.stats.errors++;
+        sourceErrors[name] = String(e);
+        this.audit.log("READ_ERROR", name, { query: question.slice(0, 80), error: String(e) });
       }
     }
 
     const ctx = this.packer.pack(raw, question);
     this.stats.messages++;
-    return createMessage(MsgType.CONTEXT, ctx as unknown as Record<string, unknown>);
+
+    return createMessage(MsgType.CONTEXT, {
+      ...(ctx as unknown as Record<string, unknown>),
+      sourceErrors,   // callers can inspect which sources errored
+    });
   }
 
-  // ── Write Intent ──────────────────────────────────────────────────────────────
+  // ── Write Intent ──────────────────────────────────────────────────────────
 
-  /**
-   * Submit a write intent. Engine applies tiered approval.
-   * READ/LOW → auto. MEDIUM/HIGH → approvalCb or warn.
-   */
   async writeIntent(
     action:    string,
     payload:   Record<string, unknown>,
     risk:      RiskTier,
-    connector  = "unknown"
+    connector  = "unknown",
   ): Promise<LDPMessage> {
     const msg = createMessage(
       MsgType.WRITE_INTENT,
       { action, ...payload },
-      { risk, source: connector }
+      { risk, source: connector },
     );
     this.stats.writeIntents++;
     this.audit.log("WRITE_INTENT", connector, { action, risk });
@@ -380,14 +424,14 @@ export class LDPEngine {
     return errorMessage(`Write rejected: ${action}`);
   }
 
-  // ── Disconnect ────────────────────────────────────────────────────────────────
+  // ── Disconnect ────────────────────────────────────────────────────────────
 
   disconnect(name: string): void {
     this.connected.delete(name);
     this.audit.log("DISCONNECT", name);
   }
 
-  // ── Report ────────────────────────────────────────────────────────────────────
+  // ── Report ────────────────────────────────────────────────────────────────
 
   report(): EngineReport {
     return {

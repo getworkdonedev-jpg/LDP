@@ -35,18 +35,35 @@ else
     echo "   Make sure Cursor is installed: https://cursor.sh"
 fi
 
-# 4. Write mcp.json
+# 4. Update mcp.json (merge, don't overwrite)
 mkdir -p "$CURSOR_CONFIG"
-cat > "$CURSOR_CONFIG/mcp.json" << MCPEOF
-{
-  "mcpServers": {
-    "ldp": {
-      "command": "python3",
-      "args": ["$LDP_PATH"]
-    }
-  }
+MCP_JSON="$CURSOR_CONFIG/mcp.json"
+
+if [ ! -f "$MCP_JSON" ]; then
+    echo "{ \"mcpServers\": {} }" > "$MCP_JSON"
+fi
+
+# Use python to merge to avoid jq dependency
+python3 - << EOF
+import json, os
+path = "$MCP_JSON"
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = {"mcpServers": {}}
+
+if "mcpServers" not in data:
+    data["mcpServers"] = {}
+
+data["mcpServers"]["ldp"] = {
+    "command": "python3",
+    "args": ["$LDP_PATH"]
 }
-MCPEOF
+
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+EOF
 
 echo ""
 echo "✓  Written to: $CURSOR_CONFIG/mcp.json"

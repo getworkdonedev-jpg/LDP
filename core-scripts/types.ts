@@ -71,9 +71,9 @@ export interface ConnectorDescriptor {
   readonly app:          string;
   readonly version:      string;
   readonly dataPaths:    readonly string[];
-  readonly permissions:  readonly string[];
-  readonly namedQueries: Readonly<Record<string, string>>;
-  readonly description:  string;
+  permissions:           readonly string[];
+  namedQueries:          Record<string, string>;
+  description:           string;
   readonly connectionHints?: Readonly<{
     readonly encryption?: "sqlcipher" | "aes-128-cbc" | "none";
     readonly keychainService?: string;

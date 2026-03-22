@@ -1,5 +1,5 @@
-import { LDPEngine } from "./engine.ts";
-import { ChromeConnector } from "./chrome.ts";
+import { LDPEngine } from "./engine.js";
+import { ChromeConnector } from "./chrome.js";
 async function main() {
     console.log("Initializing LDP Engine with REAL Chrome Connector...");
     const engine = new LDPEngine().start();

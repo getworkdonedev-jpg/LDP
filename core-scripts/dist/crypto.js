@@ -2,6 +2,9 @@
  * LDP Crypto — AES-256-GCM
  * Key derived from machine ID via PBKDF2. Never stored in plaintext.
  * All LDP data at rest is encrypted through this module.
+ *
+ * FIX CRITICAL-03: hashDescriptor now uses deepSort() for fully
+ * deterministic canonical JSON across all Node.js versions.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -74,12 +77,8 @@ export class LDPCrypto {
         decipher.setAuthTag(tag);
         return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
     }
-    encryptJson(obj) {
-        return this.encrypt(JSON.stringify(obj));
-    }
-    decryptJson(blob) {
-        return JSON.parse(this.decrypt(blob));
-    }
+    encryptJson(obj) { return this.encrypt(JSON.stringify(obj)); }
+    decryptJson(blob) { return JSON.parse(this.decrypt(blob)); }
     writeEncrypted(filePath, obj) {
         const dir = path.dirname(filePath);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -95,13 +94,42 @@ export class LDPCrypto {
             return {};
         }
     }
-    /** SHA-256 fingerprint of a connector descriptor. Used for consent verification. */
+    /**
+     * SHA-256 fingerprint of a connector descriptor.
+     *
+     * FIX CRITICAL-03: original used Object.keys(obj).sort() which only
+     * sorted top-level keys. Nested objects retained insertion order,
+     * making fingerprints non-deterministic across Node versions.
+     *
+     * Fix: deepSort() recursively sorts all object keys before
+     * JSON.stringify(), guaranteeing identical output regardless of
+     * key insertion order at any nesting depth.
+     */
     hashDescriptor(obj) {
-        const canonical = JSON.stringify(obj, Object.keys(obj).sort());
+        const canonical = JSON.stringify(deepSort(obj));
         return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 16);
     }
+}
+/**
+ * Recursively sort all object keys alphabetically.
+ * Arrays preserve order (order is meaningful in arrays).
+ * Primitives pass through unchanged.
+ */
+function deepSort(value) {
+    if (Array.isArray(value)) {
+        return value.map(deepSort);
+    }
+    if (value !== null && typeof value === "object") {
+        const sorted = {};
+        for (const key of Object.keys(value).sort()) {
+            sorted[key] = deepSort(value[key]);
+        }
+        return sorted;
+    }
+    return value;
 }
 let _instance = null;
 export function getCrypto() {
     return (_instance ??= new LDPCrypto());
 }
+//# sourceMappingURL=crypto.js.map

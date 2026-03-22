@@ -5,41 +5,117 @@ Reads: Chrome history, shell history, VS Code recent files,
        git log, terminal commands, any SQLite on your Mac.
 """
 
-import sqlite3, shutil, os, json, sys, tempfile, subprocess
+import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import List, Optional, Union, Dict
 
 # ── Common Paths & Global State ───────────────────────────────────
 HOME = Path.home()
-SIGNAL_CONFIG = HOME / "Library/Application Support/Signal/config.json"
-SIGNAL_DB = HOME / "Library/Application Support/Signal/sql/db.sqlite"
-CORE_SCRIPTS = HOME / "Desktop/LDP/core-scripts"
+SCRIPT_DIR = Path(__file__).parent
+# CORE_SCRIPTS is either alongside the server or in the parent directory
+CORE_SCRIPTS = SCRIPT_DIR / "../core-scripts"
+if not CORE_SCRIPTS.exists():
+    CORE_SCRIPTS = SCRIPT_DIR / "core-scripts"
 
 DISCOVERED_APPS = {} # AppName -> ConnectionHint/Descriptor
 
-SOURCES = {
-    "chrome": HOME / "Library/Application Support/Google/Chrome/Default/History",
-    "brave":  HOME / "Library/Application Support/BraveSoftware/Brave-Browser/Default/History",
-    "firefox": HOME / "Library/Application Support/Firefox/Profiles",
-    "vscode": HOME / "Library/Application Support/Code/User/globalStorage/state.vscdb",
-    "cursor": HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-    "imessage": HOME / "Library/Messages/chat.db",
-    "notes": HOME / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
-}
+# Platform Detection
+PLATFORM = platform.system().lower() # 'darwin', 'linux', 'windows'
 
-def find_mail_db() -> Path:
-    mail_dir = HOME / "Library/Mail"
-    if not mail_dir.exists(): return Path("")
+SIGNAL_CONFIG = HOME / "Library/Application Support/Signal/config.json"
+SIGNAL_DB = HOME / "Library/Application Support/Signal/sql/db.sqlite"
+if PLATFORM == "windows":
+    SIGNAL_CONFIG = Path(os.getenv("APPDATA", "")) / "Signal/config.json"
+    SIGNAL_DB = Path(os.getenv("APPDATA", "")) / "Signal/sql/db.sqlite"
+
+def get_platform_paths():
+    """Returns platform-specific base paths for common apps."""
+    if PLATFORM == "darwin":
+        return {
+            "chrome": HOME / "Library/Application Support/Google/Chrome",
+            "brave": HOME / "Library/Application Support/BraveSoftware/Brave-Browser",
+            "edge": HOME / "Library/Application Support/Microsoft Edge",
+            "vscode": HOME / "Library/Application Support/Code/User/globalStorage/state.vscdb",
+            "cursor": HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+            "imessage": HOME / "Library/Messages/chat.db",
+            "notes": HOME / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+            "mail": HOME / "Library/Mail",
+        }
+    elif PLATFORM == "windows":
+        appdata = Path(os.getenv("APPDATA", ""))
+        localapp = Path(os.getenv("LOCALAPPDATA", ""))
+        return {
+            "chrome": localapp / "Google/Chrome/User Data",
+            "brave": localapp / "BraveSoftware/Brave-Browser/User Data",
+            "edge": localapp / "Microsoft/Edge/User Data",
+            "vscode": appdata / "Code/User/globalStorage/state.vscdb",
+            "cursor": appdata / "Cursor/User/globalStorage/state.vscdb",
+        }
+    else: # Linux/Other
+        config = Path(os.getenv("XDG_CONFIG_HOME", HOME / ".config"))
+        return {
+            "chrome": config / "google-chrome",
+            "brave": config / "BraveSoftware/Brave-Browser",
+            "edge": config / "microsoft-edge",
+            "vscode": config / "Code/User/globalStorage/state.vscdb",
+            "cursor": config / "Cursor/User/globalStorage/state.vscdb",
+        }
+
+PLATFORM_PATHS = get_platform_paths()
+
+def find_browser_history(browser: str) -> list[Path]:
+    """Finds all browser history paths across all profiles."""
+    if browser not in PLATFORM_PATHS: return []
+    base = PLATFORM_PATHS[browser]
+    if not base.exists(): return []
+    
+    found = []
+    # Profiles are usually subdirs. Look for 'History' file in them.
+    # On Windows/Linux, profiles are often in 'User Data' or similar.
+    search_dirs = [base]
+    if PLATFORM != "darwin": # Windows/Linux often have profiles directly in base or 'User Data'
+        search_dirs.append(base)
+    
+    # Common profile names to check first (fast)
+    for profile in ["Default", "Profile 1", "Profile 2", "Guest"]:
+        path = base / profile / "History"
+        if path.exists(): found.append(path)
+    
+    # Then glob for others
+    for p in base.glob("Profile *"):
+        path = p / "History"
+        if path.exists() and path not in found:
+            found.append(path)
+            
+    return found
+
+def find_mail_db() -> Optional[Path]:
+    mail_dir = PLATFORM_PATHS.get("mail")
+    if mail_dir is None or not mail_dir.exists(): return None
     v_dirs = sorted(list(mail_dir.glob("V*")), reverse=True)
     for v in v_dirs:
         db = v / "MailData/Envelope Index"
         if db.exists(): return db
-    return Path("")
+    return None
+
+# ── Active Sources ────────────────────────────────────────────────
+SOURCES = {
+    "chrome": find_browser_history("chrome"),
+    "brave":  find_browser_history("brave"),
+    "edge":   find_browser_history("edge"),
+    "vscode": PLATFORM_PATHS.get("vscode", Path("")),
+    "cursor": PLATFORM_PATHS.get("cursor", Path("")),
+    "imessage": PLATFORM_PATHS.get("imessage", Path("")),
+    "notes": PLATFORM_PATHS.get("notes", Path("")),
+}
 
 # ── SQLite reader (lock-safe copy) ────────────────────────────────
-def read_sqlite(path: Path, query: str) -> list[dict]:
-    if not path.exists():
-        return [{"error": f"Path not found: {path}"}]
+def read_sqlite(path: Path, query: str) -> list:
+    """Returns a list of rows (dicts) or raises an exception with error msg."""
+    if not path or not path.exists():
+        raise FileNotFoundError(f"Path not found: {path}")
+    
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     try:
@@ -50,25 +126,49 @@ def read_sqlite(path: Path, query: str) -> list[dict]:
         con.close()
         return rows
     except PermissionError:
-        return [{"error": f"LDP Permission Denied: Mac Full Disk Access required for {path.name}. Grant FDA to 'Terminal' and 'Cursor' in System Settings."}]
+        raise PermissionError(f"LDP Permission Denied: Mac Full Disk Access required for {path.name}. Grant FDA to 'Terminal' and 'Cursor' in System Settings.")
     except Exception as e:
-        return [{"error": str(e)}]
+        raise Exception(f"SQLite Error on {path.name}: {str(e)}")
     finally:
         try: os.unlink(tmp.name)
         except: pass
-    return []
 
 # ── Tool implementations ──────────────────────────────────────────
 
 def tool_chrome_history(limit: int = 30) -> str:
-    path = SOURCES["chrome"] if SOURCES["chrome"].exists() else SOURCES["brave"]
-    rows = read_sqlite(path, f"SELECT url, title, visit_count FROM urls ORDER BY visit_count DESC LIMIT {limit}")
-    if not rows or (isinstance(rows, list) and len(rows) > 0 and "error" in rows[0]):
-        return "Chrome/Brave history not found or error reading."
+    # Ensure all components are lists before adding
+    c = SOURCES.get("chrome", [])
+    b = SOURCES.get("brave", [])
+    e = SOURCES.get("edge", [])
+    paths = (c if isinstance(c, list) else [c]) + \
+            (b if isinstance(b, list) else [b]) + \
+            (e if isinstance(e, list) else [e])
+    actual_paths = [p for p in paths if isinstance(p, Path) and p.exists()]
+    if not actual_paths:
+        return "No browser history found (Chrome/Brave/Edge)."
+    
+    all_rows = []
+    for path in actual_paths:
+        try:
+            rows = read_sqlite(path, f"SELECT url, title, visit_count FROM urls ORDER BY visit_count DESC LIMIT {limit}")
+            all_rows.extend(rows)
+        except: continue
+    
+    if not all_rows:
+        return "No history entries found."
+        
+    # Sort and limit combined results
+    all_rows.sort(key=lambda x: x.get("visit_count", 0), reverse=True)
+    rows = all_rows[:limit]
+    
     out = [f"{'URL':<60} {'VISITS':>6}"]
     for r in rows:
-        url = str(r.get("url",""))[:58]
-        out.append(f"{url:<60} {r.get('visit_count',0):>6}")
+        u = r.get("url")
+        url_str = str(u) if u is not None else ""
+        url_cut = url_str[:58]
+        v = r.get("visit_count")
+        visits = int(v) if v is not None else 0
+        out.append(f"{url_cut:<60} {visits:>6}")
     return "\n".join(out)
 
 def tool_shell_history(limit: int = 50) -> str:
@@ -78,28 +178,76 @@ def tool_shell_history(limit: int = 50) -> str:
             try:
                 lines = h.read_text(errors="ignore").splitlines()
                 cmds = [l.split(";")[-1] if ";" in l else l for l in lines if l.strip()]
-                return "\n".join(cmds[-limit:][::-1])
+                # Return unique commands, reversed (most recent first)
+                out = []
+                seen = set()
+                for cmd in reversed(cmds):
+                    if cmd not in seen:
+                        out.append(cmd)
+                        seen.add(cmd)
+                        if len(out) >= limit: break
+                return "\n".join(out)
             except: continue
     return "No shell history found."
 
-def tool_discover_apps() -> str:
+def tool_discover_apps(at_startup: bool = False) -> str:
     """Run the TypeScript auto-connector to find and identify local databases."""
     try:
+        # Use run-auto.ts for the latest v2.0 logic, but fallback to auto-connector if needed
+        script = CORE_SCRIPTS / "auto-connector.ts"
+        if not script.exists():
+            return "Discovery failed: TypeScript source not found."
+            
         result = subprocess.run(
-            ["npx", "tsx", str(CORE_SCRIPTS / "auto-connector.ts"), "--json"],
-            capture_output=True, text=True, timeout=30, cwd=str(CORE_SCRIPTS)
+            ["npx", "tsx", str(script), "--json"],
+            capture_output=True, text=True, timeout=60, cwd=str(CORE_SCRIPTS)
         )
         if result.returncode != 0: return f"Discovery failed: {result.stderr}"
-        apps = json.loads(result.stdout)
-        if not apps: return "No apps found."
         
-        out = ["Discovered apps:\n"]
+        # Parse JSON output
+        try:
+            apps = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return f"Discovery failed: Invalid JSON output from scanner."
+
+        if not apps: return "No new apps found."
+        
+        count = 0
         for a in apps:
-            name = a.get("descriptor", {}).get("app", "Unknown")
-            DISCOVERED_APPS[name.lower()] = a
-            out.append(f"  - {name} ({a.get('sourcePath','')})")
-        return "\n".join(out)
-    except Exception as e: return f"Error: {e}"
+            desc = a.get("descriptor", {})
+            name = desc.get("app", "Unknown")
+            name_key = desc.get("name", name.lower().replace(" ", "_"))
+            
+            # CRITICAL: Do not add Signal as a default tool (user approval required)
+            if "signal" in name_key.lower() and at_startup:
+                DISCOVERED_APPS[name_key.lower()] = a
+                continue
+
+            # Register app in global state
+            DISCOVERED_APPS[name_key.lower()] = a
+            
+            # Dynamically add to TOOLS if not already present
+            tool_name = f"ldp_{name_key.lower()}_query"
+            if not any(t["name"] == tool_name for t in TOOLS):
+                TOOLS.append({
+                    "name": tool_name,
+                    "description": f"Query {name} data. {desc.get('description', '')}",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Optional SQL query. Leave empty for smart defaults."},
+                            "limit": {"type": "integer", "default": 10}
+                        }
+                    }
+                })
+                TOOL_MAP[tool_name] = lambda args, n=name_key: tool_query_app(n, args.get("query", ""), args.get("limit", 10))
+                count += 1
+        
+        if at_startup:
+            sys.stderr.write(f"[LDP] Auto-discovered {count} apps at startup.\n")
+            return f"Synchronized {count} apps."
+        return f"Discovered {count} new apps and registered them as tools."
+    except Exception as e: return f"Error during discovery: {e}"
 
 def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
     """Dynamically query a discovered app. Handles decryption automatically."""
@@ -109,17 +257,25 @@ def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
     path = None
     if "imessage" in name_low: path = SOURCES["imessage"]
     elif "notes" in name_low: path = SOURCES["notes"]
-    elif "chrome" in name_low: path = SOURCES["chrome"]
-    elif "brave" in name_low: path = SOURCES["brave"]
+    elif "chrome" in name_low: 
+        c = SOURCES.get("chrome", [])
+        path = c[0] if isinstance(c, list) and c else None
+    elif "brave" in name_low: 
+        b = SOURCES.get("brave", [])
+        path = b[0] if isinstance(b, list) and b else None
+    elif "edge" in name_low: 
+        e = SOURCES.get("edge", [])
+        path = e[0] if isinstance(e, list) and e else None
     elif "mail" in name_low or "gmail" in name_low: path = find_mail_db()
     
     # 2. If not a fallback, check dynamic discovery
-    if not path or not path.exists():
+    if path is None or not path.exists():
         if name_low not in DISCOVERED_APPS: tool_discover_apps()
         if name_low in DISCOVERED_APPS:
-            path = Path(DISCOVERED_APPS[name_low]["sourcePath"])
+            p_str = str(DISCOVERED_APPS[name_low].get("sourcePath", ""))
+            path = Path(p_str)
     
-    if not path or not path.exists():
+    if path is None or not path.exists():
         if "signal" in name_low: return tool_signal_messages(limit=limit)
         return f"App '{app_name}' not found locally. To read Gmail, ensure you have synced your account in the Mac Mail app."
 
@@ -131,17 +287,41 @@ def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
     actual_query = query
     if not actual_query:
         if "imessage" in name_low:
-            actual_query = f"SELECT text, datetime(date/1000000000 + 978307200,'unixepoch','localtime') as date FROM message WHERE text IS NOT NULL ORDER BY date DESC LIMIT {limit}"
+            # Join message with handle to get sender ID
+            actual_query = f"""
+                SELECT 
+                    m.text, 
+                    h.id as sender,
+                    datetime(m.date/1000000000 + 978307200,'unixepoch','localtime') as date 
+                FROM message m 
+                LEFT JOIN handle h ON m.handle_id = h.ROWID 
+                WHERE m.text IS NOT NULL 
+                ORDER BY m.date DESC LIMIT {limit}
+            """
         elif "notes" in name_low:
-            actual_query = f"SELECT ZTITLE as title FROM ZICCLOUDSYNCINGOBJECT WHERE ZTITLE IS NOT NULL LIMIT {limit}"
+            # Get note title and some snippet
+            actual_query = f"SELECT ZTITLE as title, ZSNIPPET as snippet FROM ZICCLOUDSYNCINGOBJECT WHERE ZTITLE IS NOT NULL LIMIT {limit}"
         elif "mail" in name_low or "gmail" in name_low:
             # Join messages with addresses to get sender info
-            actual_query = f"SELECT m.subject, a.address as sender FROM messages m JOIN addresses a ON m.sender = a.ROWID ORDER BY m.date_received DESC LIMIT {limit}"
+            actual_query = f"""
+                SELECT 
+                    m.subject, 
+                    a.address as sender,
+                    datetime(m.date_received + 978307200, 'unixepoch', 'localtime') as date
+                FROM messages m 
+                JOIN addresses a ON m.sender = a.ROWID 
+                ORDER BY m.date_received DESC LIMIT {limit}
+            """
         else:
             actual_query = "SELECT * FROM sqlite_master LIMIT 1"
 
-    data = read_sqlite(path, actual_query)
-    return json.dumps(data, indent=2)
+    try:
+        if path is None or not isinstance(path, Path):
+             return f"Error: App '{app_name}' path not found or invalid."
+        data = read_sqlite(path, actual_query)
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return f"Error querying {app_name}: {e}"
 
 def tool_installed_apps(include_system: bool = False) -> str:
     paths = [Path("/Applications"), Path.home() / "Applications"]
@@ -152,17 +332,74 @@ def tool_installed_apps(include_system: bool = False) -> str:
             apps.extend([item.stem for item in p.iterdir() if item.suffix == ".app"])
     return "Installed Apps:\n" + "\n".join(sorted(list(set(apps))))
 
+def tool_check_permissions() -> str:
+    """Check read access to protected paths and provide FDA guidance."""
+    results = {}
+    protected = {
+        "iMessage": PLATFORM_PATHS.get("imessage"),
+        "Apple Mail": find_mail_db(),
+        "Apple Notes": PLATFORM_PATHS.get("notes"),
+        "Chrome History": (SOURCES["chrome"][0] if SOURCES["chrome"] else None) if isinstance(SOURCES["chrome"], list) else SOURCES["chrome"],
+    }
+    for name, p in protected.items():
+        if p is None:
+            results[name] = "Not Found"
+            continue
+        try:
+            # Ensure p is a Path object for open()
+            target = Path(str(p))
+            with open(target, 'rb') as f:
+                f.read(1)
+            results[name] = "Access Granted"
+        except PermissionError:
+            results[name] = "Permission Denied (FDA required)"
+        except Exception as e:
+            results[name] = f"Error: {e}"
+            
+    status = json.dumps(results, indent=2)
+    guidance = "\n\nTo fix 'Permission Denied', grant 'Full Disk Access' to 'Terminal' and 'Cursor' in System Settings > Privacy & Security."
+    return status + guidance
+
+def tool_global_search(query: str, limit: int = 5) -> str:
+    """Search across all major connected sources."""
+    results = []
+    # Search Shell
+    shell = tool_shell_history(limit=50)
+    for line in shell.splitlines():
+        if query.lower() in line.lower():
+            results.append({"source": "shell", "content": line})
+            if len(results) >= limit: break
+            
+    # Search Browser
+    c = SOURCES.get("chrome", [])
+    b = SOURCES.get("brave", [])
+    e = SOURCES.get("edge", [])
+    paths = (c if isinstance(c, list) else [c]) + \
+            (b if isinstance(b, list) else [b]) + \
+            (e if isinstance(e, list) else [e])
+    for p in paths:
+        if not isinstance(p, Path) or not p.exists(): continue
+        if len(results) >= limit * 2: break
+        try:
+            rows = read_sqlite(p, f"SELECT title, url FROM urls WHERE title LIKE '%{query}%' OR url LIKE '%{query}%' LIMIT {limit}")
+            for r in rows:
+                results.append({"source": "browser", "content": f"{str(r.get('title'))} ({str(r.get('url'))})"})
+        except: continue
+        
+    return json.dumps(results[:limit*2], indent=2)
+
 def tool_diagnostics() -> str:
     """Check server health and capabilities."""
     return json.dumps({
         "status": "ready",
-        "version": "1.1.0-Dynamic-Discovery",
+        "platform": PLATFORM,
+        "version": "1.2.0-CrossPlatform",
         "paths": {
             "server": str(Path(__file__)),
             "core": str(CORE_SCRIPTS)
         },
         "discovered_apps_count": len(DISCOVERED_APPS),
-        "capabilities": ["Signal-SQLCipher", "iMessage-SmartQuery", "AppleNotes-Heuristic", "AppleMail-GmailProxy", "Dynamic-AutoConnect"]
+        "capabilities": ["Signal-SQLCipher", "iMessage-SmartQuery", "AppleNotes-Heuristic", "AppleMail-GmailProxy", "Dynamic-AutoConnect", "Global-Search", "FDA-Diagnostics"]
     }, indent=2)
 
 def tool_signal_messages(limit: int = 10, query_type: str = "messages") -> str:
@@ -187,13 +424,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 // Decrypt the key v10
-const keychainPass = '{keychain_pass}';
-const encKey = '{enc_key}';
-const salt = Buffer.from('saltysalt');
-const iterations = 1003;
+const keychainPass = {json.dumps(keychain_pass)};
+const encKey = {json.dumps(enc_key)};
+const salt = Buffer.from('saltysalt'); // Note: Signal salt is traditionally 'saltysalt' for v10
+const iterations = 1003;              // Note: Signal iterations is traditionally 1003 for v10
 const derivedKey = crypto.pbkdf2Sync(keychainPass, salt, iterations, 16, 'sha1');
 const ciphertext = Buffer.from(encKey, 'hex').slice(3);
-const iv = Buffer.from(' '.repeat(16));
+const iv = Buffer.from(' '.repeat(16)); // Note: Signal IV is traditionally 16 spaces for v10
 const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv);
 let decrypted = decipher.update(ciphertext);
 decrypted = Buffer.concat([decrypted, decipher.final()]);
@@ -220,26 +457,33 @@ fs.unlinkSync(tmp);
 
 TOOLS = [
     {"name": "ldp_diagnostics", "description": "Check LDP server status and version.", "inputSchema": {"type":"object"}},
+    {"name": "ldp_check_permissions", "description": "Check Mac Full Disk Access permissions.", "inputSchema": {"type":"object"}},
+    {"name": "ldp_global_search", "description": "Search across all local history/data.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
     {"name": "ldp_query_app", "description": "Query any discovered app (Signal, Chrome etc)", "inputSchema": {"type":"object", "properties": {"app_name": {"type":"string"}, "query":{"type":"string"}}}},
     {"name": "ldp_discover_apps", "description": "Scan Mac for local data apps", "inputSchema": {"type":"object"}},
     {"name": "ldp_installed_apps", "description": "List all apps in /Applications", "inputSchema": {"type":"object"}},
-    {"name": "ldp_signal_messages", "description": "Read Signal messages", "inputSchema": {"type":"object", "properties": {"limit":{"type":"integer"}}}},
-    {"name": "ldp_chrome_history", "description": "Read Chrome history", "inputSchema": {"type":"object"}},
+    {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
     {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
 ]
 
 TOOL_MAP = {
     "ldp_diagnostics": lambda a: tool_diagnostics(),
+    "ldp_check_permissions": lambda a: tool_check_permissions(),
+    "ldp_global_search": lambda a: tool_global_search(a.get("query","")),
     "ldp_query_app": lambda a: tool_query_app(a.get("app_name",""), a.get("query","")),
     "ldp_discover_apps": lambda a: tool_discover_apps(),
     "ldp_installed_apps": lambda a: tool_installed_apps(),
-    "ldp_signal_messages": lambda a: tool_signal_messages(a.get("limit",10)),
     "ldp_chrome_history": lambda a: tool_chrome_history(),
     "ldp_shell_history": lambda a: tool_shell_history(),
 }
 
 def main():
-    sys.stderr.write("[LDP] Dynamic Server Started\n")
+    sys.stderr.write("[LDP] Dynamic Server Starting...\n")
+    
+    # Run discovery at startup to populate TOOLS
+    tool_discover_apps(at_startup=True)
+    
+    sys.stderr.write("[LDP] Dynamic Server Ready\n")
     for line in sys.stdin:
         try:
             req = json.loads(line)

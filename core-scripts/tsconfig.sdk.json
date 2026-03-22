@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target":                     "ES2022",
+    "module":                     "Node16",
+    "moduleResolution":           "Node16",
+    "outDir":                     "./dist",
+    "rootDir":                    ".",
+    "strict":                     true,
+    "esModuleInterop":            true,
+    "skipLibCheck":               true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration":                true,
+    "declarationMap":             true,
+    "sourceMap":                  true,
+    "resolveJsonModule":          true,
+    "allowImportingTsExtensions": false,
+    "verbatimModuleSyntax":       false
+  },
+  "include": [
+    "engine.ts", "crypto.ts", "types.ts", "base.ts",
+    "chrome.ts", "signal.ts", "mcp.ts", "synthetic.ts",
+    "auto-connector.ts", "main.ts", "index.ts",
+    "discover.ts", "distill.ts", "privacy.ts", "pact.ts",
+    "rag.ts", "memory.ts", "agents.ts",
+    "brain.ts", "learned.ts", "scanner.ts"
+  ],
+  "exclude": ["node_modules", "dist", "test-*.ts"]
+}

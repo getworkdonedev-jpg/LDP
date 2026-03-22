@@ -38,3 +38,4 @@ export const ackMessage = (payload) => createMessage(MsgType.ACK, payload);
 export const errorMessage = (error) => createMessage(MsgType.ERROR, { error });
 export const isAck = (msg) => msg.type === MsgType.ACK;
 export const isError = (msg) => msg.type === MsgType.ERROR;
+//# sourceMappingURL=types.js.map

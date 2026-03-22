@@ -50,3 +50,4 @@ export function findFirst(paths) {
     }
     return null;
 }
+//# sourceMappingURL=base.js.map

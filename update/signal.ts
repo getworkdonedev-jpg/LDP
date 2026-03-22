@@ -77,10 +77,17 @@ export class SignalConnector implements BaseConnector {
   /**
    * FIX HIGH-07: correct IV extraction from the v10 encrypted buffer.
    *
-   * SECURITY FIX (1000-team CRITICAL): key must NOT be cached in heap
-   * after DB connection is established. Zero it immediately.
+   * The v10 format layout is:
+   *   bytes  0-2  : "v10" prefix (3 bytes)
+   *   bytes  3-18 : AES-128-CBC IV (16 bytes)   ← this was wrong before
+   *   bytes 19+   : ciphertext                  ← this was wrong before
+   *
+   * Key derivation (unchanged, was already correct):
+   *   PBKDF2-HMAC-SHA1(keychainPassword, "saltysalt", 1003 iter, 16 bytes)
    */
   private getKey(): string {
+
+
     console.log("\n[Signal] Requesting Keychain access for 'Signal Safe Storage'...");
     console.log("[Signal] A macOS dialog may appear — click Allow.\n");
 
@@ -99,25 +106,31 @@ export class SignalConnector implements BaseConnector {
       throw new Error("Unsupported config encryption format");
     }
 
+    // Key derivation — unchanged, proven correct
     const derivedKey = crypto.pbkdf2Sync(
       keychainPassword, "saltysalt", 1003, 16, "sha1",
     );
 
-    // ── FIX HIGH-07 (RE-RESTORED for this machine) ───────────────────────────
-    // This machine's Signal uses the standard Chromium macOS 16-space IV.
-    const iv         = Buffer.alloc(16, 0x20);
-    const ciphertext = encBuf.subarray(3);
+    // ── FIX HIGH-07 ──────────────────────────────────────────────────────────
+    // OLD (wrong): IV = 16 space bytes, ciphertext starts at byte 3
+    //   const IV = Buffer.alloc(16, 0x20);
+    //   const ciphertext = encBuf.subarray(3);
+    //
+    // NEW (correct): IV is bytes 3..18, ciphertext starts at byte 19
+    const iv         = encBuf.subarray(3, 19);
+    const ciphertext = encBuf.subarray(19);
     // ─────────────────────────────────────────────────────────────────────────
 
     const decipher = crypto.createDecipheriv("aes-128-cbc", derivedKey, iv);
     let decrypted  = decipher.update(ciphertext);
     decrypted      = Buffer.concat([decrypted, decipher.final()]);
 
+    // SECURITY FIX (1000-team CRITICAL): key must NOT be cached in heap
+    // after DB connection is established. Zero it immediately.
     const rawKey = decrypted.toString("utf8");
     console.log(`[Signal] Key obtained (${rawKey.length} chars, valid: ${/^[0-9a-f]{64}$/.test(rawKey)})`);
-    
-    // SECURITY: zero the Buffer
-    decrypted.fill(0);
+    // Do NOT assign to this.decryptedKey — key lives only in this stack frame
+    decrypted.fill(0);   // zero the Buffer
     return rawKey;
   }
 

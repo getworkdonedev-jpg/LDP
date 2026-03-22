@@ -2,7 +2,22 @@
  * LDP Synthetic Connectors
  * Spotify, Banking, Files, WhatsApp — all with realistic fake data.
  * Use for development and testing without real apps installed.
+ *
+ * FIX MEDIUM-09: replaced all Math.random() calls with a seeded
+ * deterministic LCG (linear congruential generator).
+ * Synthetic connectors now produce identical data on every run,
+ * making unit tests fully reproducible and snapshots stable.
  */
+// ── Seeded deterministic RNG ──────────────────────────────────────────────────
+// FIX MEDIUM-09: LCG with constants from Knuth / Numerical Recipes.
+// Each connector gets its own seed so datasets are independent but stable.
+function makeLCG(seed) {
+    let s = seed >>> 0;
+    return () => {
+        s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+        return s / 0x100000000;
+    };
+}
 // ── Spotify ───────────────────────────────────────────────────────────────────
 export class SyntheticSpotifyConnector {
     descriptor = {
@@ -26,8 +41,9 @@ export class SyntheticSpotifyConnector {
                 ms_played: "milliseconds played", skipped: "was skipped" } };
     }
     async read(query, limit = 500) {
+        const rng = makeLCG(1); // seed 1 — stable across runs
         const q = query.toLowerCase();
-        let rows = this.tracks.map(t => ({ ...t, _recency: Math.random() * 0.7 + 0.3 }));
+        let rows = this.tracks.map(t => ({ ...t, _recency: rng() * 0.7 + 0.3 }));
         if (/focus|work|study/.test(q))
             rows = rows.filter(r => r.focus);
         return rows.sort((a, b) => b.plays - a.plays).slice(0, limit);
@@ -62,17 +78,18 @@ export class SyntheticBankingConnector {
     };
     txns;
     constructor() {
+        const rng = makeLCG(2); // seed 2 — stable, independent from Spotify
         const now = Date.now() / 1000;
         this.txns = [];
         for (let i = 0; i < 90; i++) {
             const dayTs = now - (89 - i) * 86400;
-            const count = Math.floor(Math.random() * 4) + 1;
+            const count = Math.floor(rng() * 4) + 1;
             for (let j = 0; j < count; j++) {
-                const [merchant, cat, avg] = MERCHANTS[Math.floor(Math.random() * MERCHANTS.length)];
+                const [merchant, cat, avg] = MERCHANTS[Math.floor(rng() * MERCHANTS.length)];
                 this.txns.push({
                     date: new Date(dayTs * 1000).toISOString().slice(0, 10),
                     merchant, category: cat,
-                    amount: Math.round(avg * (0.7 + Math.random() * 0.6) * 100) / 100,
+                    amount: Math.round(avg * (0.7 + rng() * 0.6) * 100) / 100,
                     type: cat === "income" ? "credit" : "debit",
                     _recency: Math.max(0, 1 - (89 - i) / 90),
                 });
@@ -175,13 +192,14 @@ export class SyntheticWhatsAppConnector {
                 initiated_by: "who starts conversations" } };
     }
     async read(query, limit = 500) {
+        const rng = makeLCG(3); // seed 3 — stable, independent
         const now = Date.now() / 1000;
         const rows = this.contacts.map(contact => ({
             contact,
-            message_count: Math.floor(Math.random() * 490 + 10),
-            last_message: new Date((now - Math.random() * 30 * 86400) * 1000).toISOString().slice(0, 10),
-            initiated_by: ["you", "them", "equal"][Math.floor(Math.random() * 3)],
-            _recency: Math.random() * 0.8 + 0.2,
+            message_count: Math.floor(rng() * 490 + 10),
+            last_message: new Date((now - rng() * 30 * 86400) * 1000).toISOString().slice(0, 10),
+            initiated_by: ["you", "them", "equal"][Math.floor(rng() * 3)],
+            _recency: rng() * 0.8 + 0.2,
         }));
         return rows.sort((a, b) => b.message_count - a.message_count).slice(0, limit);
     }
@@ -192,3 +210,4 @@ export function registerAllSynthetic(engine) {
     engine.register(new SyntheticFilesConnector());
     engine.register(new SyntheticWhatsAppConnector());
 }
+//# sourceMappingURL=synthetic.js.map

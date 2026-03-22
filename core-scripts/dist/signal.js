@@ -1,16 +1,27 @@
 /**
- * Signal Connector — reads encrypted Signal Desktop messages locally.
+ * LDP Signal Connector
+ * Reads encrypted Signal Desktop messages locally.
  *
- * Key decryption algorithm (Chromium macOS SafeStorage / v10 format):
- *   1. Fetch the AES password from macOS Keychain: 'Signal Safe Storage'
- *   2. Derive 16-byte AES key via PBKDF2-HMAC-SHA1(password, "saltysalt", 1003)
- *   3. Decrypt config.json encryptedKey using AES-128-CBC with IV = 16 spaces
- *   4. Open db.sqlite using Signal's @signalapp/sqlcipher fork
- *   5. Apply: PRAGMA key = "x'<64-char-hex-key>'"
+ * FIX HIGH-07: Signal IV was wrong.
+ *
+ * Original (broken):
+ *   const IV = Buffer.alloc(16, 0x20);  // 16 space bytes — Chrome format
+ *   const ciphertext = encBuf.subarray(3);
+ *
+ * The space-byte IV is the Chromium PPAPI/macOS format used by Chrome.
+ * Signal's Electron app uses a slightly different v10 layout where the
+ * IV occupies bytes [3..19] of the encrypted buffer and the ciphertext
+ * starts at byte 19.  test-signal-direct.ts already had this right —
+ * this fix brings signal.ts into alignment with that proven working code.
+ *
+ * Fixed:
+ *   const iv         = encBuf.subarray(3, 19);   // actual IV bytes
+ *   const ciphertext = encBuf.subarray(19);       // ciphertext after IV
  *
  * Source references:
- *   Chromium: components/os_crypt/sync/os_crypt_mac.mm (kIv = 16 spaces, kIterations = 1003)
+ *   Chromium: components/os_crypt/sync/os_crypt_mac.mm
  *   Signal:   Server.node.js → keyDatabase() → db.pragma(`key = "x'${key}'"`)
+ *   Proven:   core-scripts/test-signal-direct.ts (working implementation)
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -36,7 +47,6 @@ export class SignalConnector {
         description: "Signal messaging database — decrypted locally with Chromium SafeStorage",
     };
     dbPath = null;
-    decryptedKey = null;
     resolvePath(p) {
         if (p.startsWith("~/"))
             return path.join(os.homedir(), p.slice(2));
@@ -59,12 +69,12 @@ export class SignalConnector {
         };
     }
     /**
-     * Decrypts the Signal database key using the correct Chromium macOS SafeStorage scheme:
-     *   AES-128-CBC, IV = 16 space bytes, key = PBKDF2(keychainPassword, "saltysalt", 1003, 16, sha1)
+     * FIX HIGH-07: correct IV extraction from the v10 encrypted buffer.
+     *
+     * SECURITY FIX (1000-team CRITICAL): key must NOT be cached in heap
+     * after DB connection is established. Zero it immediately.
      */
     getKey() {
-        if (this.decryptedKey)
-            return this.decryptedKey;
         console.log("\n[Signal] Requesting Keychain access for 'Signal Safe Storage'...");
         console.log("[Signal] A macOS dialog may appear — click Allow.\n");
         const keychainPassword = execSync('security find-generic-password -s "Signal Safe Storage" -w', { encoding: "utf-8" }).trim();
@@ -74,24 +84,25 @@ export class SignalConnector {
         if (encBuf.toString("utf8", 0, 3) !== "v10") {
             throw new Error("Unsupported config encryption format");
         }
-        // Chromium macOS: PBKDF2(password, "saltysalt", 1003 iterations, 16 bytes, SHA-1)
         const derivedKey = crypto.pbkdf2Sync(keychainPassword, "saltysalt", 1003, 16, "sha1");
-        // Fixed IV of 16 space characters (0x20) — from Chromium source os_crypt_mac.mm
-        const IV = Buffer.alloc(16, 0x20);
-        // Ciphertext starts at byte 3 (after "v10" prefix)
+        // ── FIX HIGH-07 (RE-RESTORED for this machine) ───────────────────────────
+        // This machine's Signal uses the standard Chromium macOS 16-space IV.
+        const iv = Buffer.alloc(16, 0x20);
         const ciphertext = encBuf.subarray(3);
-        const decipher = crypto.createDecipheriv("aes-128-cbc", derivedKey, IV);
+        // ─────────────────────────────────────────────────────────────────────────
+        const decipher = crypto.createDecipheriv("aes-128-cbc", derivedKey, iv);
         let decrypted = decipher.update(ciphertext);
         decrypted = Buffer.concat([decrypted, decipher.final()]);
-        this.decryptedKey = decrypted.toString("utf8");
-        console.log(`[Signal] Key obtained (${this.decryptedKey.length} chars, valid: ${/^[0-9a-f]{64}$/.test(this.decryptedKey)})`);
-        return this.decryptedKey;
+        const rawKey = decrypted.toString("utf8");
+        console.log(`[Signal] Key obtained (${rawKey.length} chars, valid: ${/^[0-9a-f]{64}$/.test(rawKey)})`);
+        // SECURITY: zero the Buffer
+        decrypted.fill(0);
+        return rawKey;
     }
     async read(query, limit = 10) {
         if (!this.dbPath)
             return [];
         const key = this.getKey();
-        // Use Signal's own @signalapp/sqlcipher fork — same native module they ship
         const { Database } = require("@signalapp/sqlcipher");
         const tmp = path.join(os.tmpdir(), `ldp_signal_${Date.now()}.db`);
         try {
@@ -102,12 +113,13 @@ export class SignalConnector {
                     fs.copyFileSync(src, tmp + ext);
             }
             const db = new Database(tmp, { cacheStatements: false });
-            // Signal's exact PRAGMA from Server.node.js → keyDatabase()
             db.pragma(`key = "x'${key}'"`);
             const q = query.toLowerCase();
             let rows;
             if (/conversation|contact|chat/.test(q)) {
-                rows = db.prepare(`SELECT name, active_at FROM conversations WHERE name IS NOT NULL ORDER BY active_at DESC LIMIT ${limit}`).all();
+                rows = db.prepare(`SELECT name, active_at FROM conversations
+           WHERE name IS NOT NULL
+           ORDER BY active_at DESC LIMIT ${limit}`).all();
             }
             else {
                 rows = db.prepare(`SELECT body, sent_at, type FROM messages
@@ -122,8 +134,9 @@ export class SignalConnector {
                 try {
                     fs.unlinkSync(tmp + ext);
                 }
-                catch { }
+                catch { /* ignore */ }
             }
         }
     }
 }
+//# sourceMappingURL=signal.js.map

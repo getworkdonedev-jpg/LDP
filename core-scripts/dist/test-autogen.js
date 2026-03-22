@@ -207,12 +207,11 @@ async function runTests() {
         const gen = new AutoConnectorGenerator({ extraPaths: [tmpDir] });
         const result = await gen.generateForFile(fakePath);
         assert(result !== null, "Should generate result");
-        await result.connector.connect(); // should not throw
-        assert(true, "connect() succeeded");
+        await result.connector.discover(); // should not throw
+        assert(true, "discover() succeeded");
     });
     await test("connector.connect() throws when file missing", async () => {
         const gen = new AutoConnectorGenerator({ extraPaths: [tmpDir] });
-        const { ConnectorDescriptor: _, ...rest } = await import("./types.js");
         // Build a connector manually pointing at a nonexistent path
         const fakePath = path.join(tmpDir, "nonexistent_after_scan.db");
         // Create temporarily, generate, then delete
@@ -222,14 +221,8 @@ async function runTests() {
         assert(result !== null, "Should generate");
         // Now delete the file
         fs.unlinkSync(fakePath);
-        let threw = false;
-        try {
-            await result.connector.connect();
-        }
-        catch {
-            threw = true;
-        }
-        assert(threw, "connect() should throw when source file deleted");
+        const success = await result.connector.discover();
+        assert(!success, "discover() should return false when source file deleted");
     });
     // ─ 5. Full scan ───────────────────────────────────────────────────────────
     console.log("\nFull scan");
