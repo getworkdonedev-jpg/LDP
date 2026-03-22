@@ -149,8 +149,8 @@ PLATFORM_PATHS = get_platform_paths()
 CATEGORY_MAP = {
     "browser":       ["chrome", "brave", "firefox", "safari", "edge", "arc"],
     "communication": ["signal", "whatsapp", "imessage", "telegram", "messages"],
-    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm"],
-    "personal":      ["claude", "spotify", "notes", "calendar", "animoji", "photos"],
+    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm", "calendar", "contacts"],
+    "personal":      ["claude", "spotify", "notes", "animoji", "photos"],
     "system":        ["shell", "dock", "system", "kernel", "drivefs", "tipkit", "coredatabackend"],
 }
 
@@ -1132,23 +1132,32 @@ def rebuild_tools():
     new_tools = []
     
     STATIC_MAP = {
+        "ldp_diagnostics": "system",
+        "ldp_check_permissions": "system",
+        "ldp_global_search": "system",
+        "ldp_query_app": "system",
+        "ldp_discover_apps": "system",
+        "ldp_installed_apps": "system",
+        "ldp_manage_approvals": "system",
         "ldp_chrome_history": "browser",
         "ldp_shell_history": "system",
-        "ldp_claude_history": "personal",
+        "ldp_claude_history": "exports",
         "ldp_imessage_history": "communication",
-        "ldp_calendar_history": "personal",
-        "ldp_contacts_history": "communication",
+        "ldp_calendar_history": "work",
+        "ldp_contacts_history": "work",
     }
     
     for st in ALL_STATIC_TOOLS:
         cat = STATIC_MAP.get(st["name"], "unknown")
-        if approvals.is_app_denied(st["name"], cat) or approvals.is_app_paused(st["name"]): continue
+        if cat != "system":
+            if approvals.is_app_denied(st["name"], cat) or approvals.is_app_paused(st["name"]): continue
         new_tools.append(st)
         
     for name_key in DISCOVERED_APPS.keys():
         cat = classify_app(name_key)
         t_name = f"ldp_{name_key}_query"
-        if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
+        if cat != "system":
+            if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
         new_tools.append({
             "name": t_name,
             "description": f"Query {name_key} local database...",
@@ -1157,6 +1166,7 @@ def rebuild_tools():
         
     for name_key, cat in DISCOVERED_EXPORTS.items():
         t_name = f"ldp_export_{name_key.replace('-','_')}_query"
+        cat = "exports"
         if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
         new_tools.append({
             "name": t_name,
@@ -1208,11 +1218,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             
             d_state = { "tools": {} }
             STATIC_MAP = {
-                "ldp_chrome_history": "browser", "ldp_shell_history": "system", "ldp_claude_history": "personal",
-                "ldp_imessage_history": "communication", "ldp_calendar_history": "personal", "ldp_contacts_history": "communication",
+        "ldp_diagnostics": "system",
+        "ldp_check_permissions": "system",
+        "ldp_global_search": "system",
+        "ldp_query_app": "system",
+        "ldp_discover_apps": "system",
+        "ldp_installed_apps": "system",
+        "ldp_manage_approvals": "system",
+        "ldp_chrome_history": "browser",
+        "ldp_shell_history": "system",
+        "ldp_claude_history": "exports",
+        "ldp_imessage_history": "communication",
+        "ldp_calendar_history": "work",
+        "ldp_contacts_history": "work",
             }
             
             def add_tool_state(name, cat):
+                if cat == "system": return
                 # Using our overrides or category approvals
                 approved = not approvals.is_app_denied(name, cat)
                 paused = approvals.is_app_paused(name)
@@ -1235,7 +1257,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 
             for st in ALL_STATIC_TOOLS: add_tool_state(st["name"], STATIC_MAP.get(st["name"], "unknown"))
             for name_key in DISCOVERED_APPS.keys(): add_tool_state(f"ldp_{name_key}_query", classify_app(name_key))
-            for name_key, cat in DISCOVERED_EXPORTS.items(): add_tool_state(f"ldp_export_{name_key.replace('-','_')}_query", cat)
+            for name_key, cat in DISCOVERED_EXPORTS.items(): add_tool_state(f"ldp_export_{name_key.replace('-','_')}_query", "exports")
             
             self.wfile.write(json.dumps(d_state).encode())
             
@@ -1276,48 +1298,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
             const container = document.getElementById('tools');
             container.innerHTML = '';
             
+            const sections = {
+                "browser": { title: "Browser", tools: [] },
+                "communication": { title: "Communication", tools: [] },
+                "work": { title: "Work", tools: [] },
+                "personal": { title: "Personal", tools: [] },
+                "exports": { title: "Exports", tools: [] }
+            };
+            
             for (const [name, info] of Object.entries(data.tools)) {
-                let statusText = '';
-                let actionBtns = '';
+                let cat = info.category.toLowerCase();
+                if (!sections[cat]) sections[cat] = { title: info.category, tools: [] };
+                sections[cat].tools.push({name, info});
+            }
+            
+            for (const [cat, section] of Object.entries(sections)) {
+                if (section.tools.length === 0) continue;
                 
-                if (info.approved && !info.paused) {
-                    statusText = '<span class="status on-text">ON ●</span>';
-                    actionBtns = `
-                        <button class="btn btn-pause" onclick="postAction('/api/pause', '${name}')">PAUSE ⏸</button>
-                        <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
+                const secDiv = document.createElement('div');
+                secDiv.innerHTML = `<h2 style="margin-top: 30px; font-size: 16px; color: #aaa; border-bottom: 1px solid #333; padding-bottom: 8px;">${section.title}</h2>`;
+                container.appendChild(secDiv);
+                
+                for (const item of section.tools) {
+                    const {name, info} = item;
+                    
+                    let statusText = '';
+                    let actionBtns = '';
+                    
+                    if (info.approved && !info.paused) {
+                        statusText = '<span class="status on-text">ON ●</span>';
+                        actionBtns = `
+                            <button class="btn btn-pause" onclick="postAction('/api/pause', '${name}')">PAUSE ⏸</button>
+                            <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
+                        `;
+                    } else if (info.approved && info.paused) {
+                        statusText = '<span class="status paused-text">PAUSED ⏸</span>';
+                        actionBtns = `
+                            <button class="btn btn-on" onclick="postAction('/api/resume', '${name}')">RESUME ▶</button>
+                            <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
+                        `;
+                    } else if (!info.approved && info.can_retry) {
+                        statusText = '<span class="status off-text" style="color:#e67e22;">OFF ○</span>';
+                        actionBtns = `<button class="btn btn-orange" onclick="postAction('/api/approve', '${name}')">RE-ENABLE?</button>`;
+                    } else {
+                        statusText = '<span class="status gray-text">OFF ○</span>';
+                        actionBtns = `<button class="btn btn-gray" onclick="postAction('/api/approve', '${name}')">ENABLE</button>`;
+                    }
+                    
+                    const pretty = name.replace('ldp_', '').replace('_query', '').replace('_history', '').replace(/_/g, ' ');
+                    const prettyUpper = pretty.charAt(0).toUpperCase() + pretty.slice(1);
+                    
+                    const row = document.createElement('div');
+                    row.className = 'tool-row';
+                    if (!info.approved) row.style.opacity = '0.5';
+                    
+                    row.innerHTML = `
+                        <div>
+                            <div class="tool-name">${prettyUpper}</div>
+                            <div class="tool-cat" style="display:none;">${info.category}</div>
+                        </div>
+                        <div style="display:flex; align-items:center;">
+                            ${statusText}
+                            ${actionBtns}
+                        </div>
                     `;
-                } else if (info.approved && info.paused) {
-                    statusText = '<span class="status paused-text">PAUSED ⏸</span>';
-                    actionBtns = `
-                        <button class="btn btn-on" onclick="postAction('/api/resume', '${name}')">RESUME ▶</button>
-                        <button class="btn btn-off" onclick="revokeAction('${name}')">REVOKE ⨉</button>
-                    `;
-                } else if (!info.approved && info.can_retry) {
-                    statusText = '<span class="status off-text" style="color:#e67e22;">OFF ○</span>';
-                    actionBtns = `<button class="btn btn-orange" onclick="postAction('/api/approve', '${name}')">RE-ENABLE?</button>`;
-                } else {
-                    statusText = '<span class="status gray-text">OFF ○</span>';
-                    actionBtns = `<button class="btn btn-gray" onclick="postAction('/api/approve', '${name}')">ENABLE</button>`;
+                    secDiv.appendChild(row);
                 }
-                
-                const pretty = name.replace('ldp_', '').replace('_query', '').replace('_history', '').replace(/_/g, ' ');
-                const prettyUpper = pretty.charAt(0).toUpperCase() + pretty.slice(1);
-                
-                const row = document.createElement('div');
-                row.className = 'tool-row';
-                if (!info.approved) row.style.opacity = '0.5';
-                
-                row.innerHTML = `
-                    <div>
-                        <div class="tool-name">${prettyUpper}</div>
-                        <div class="tool-cat">${info.category}</div>
-                    </div>
-                    <div style="display:flex; align-items:center;">
-                        ${statusText}
-                        ${actionBtns}
-                    </div>
-                `;
-                container.appendChild(row);
             }
         }
         
