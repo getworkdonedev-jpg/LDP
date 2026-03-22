@@ -82,6 +82,14 @@ async function prompt(msg: string): Promise<string> {
   });
 }
 
+async function dashboard() {
+  console.log("\n  \x1b[1mOpening LDP Desktop Dashboard\x1b[0m");
+  console.log("  If browser doesn't open, visit: \x1b[36mhttp://localhost:8765\x1b[0m\n");
+  const { exec } = await import("child_process");
+  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  exec(`${cmd} http://localhost:8765`);
+}
+
 async function main() {
   switch (cmd) {
     case "start":   await start();                    break;
@@ -89,8 +97,9 @@ async function main() {
     case "query":   await query(rest.join(" "));      break;
     case "status":  status();                         break;
     case "audit":   audit();                          break;
+    case "dashboard": await dashboard();              break;
     default:
-      console.log("  Usage: ldp <start|connect|query|status|audit>");
+      console.log("  Usage: ldp <start|connect|query|status|audit|dashboard>");
   }
 }
 

@@ -15,13 +15,16 @@ HOME = Path.home()
 SCRIPT_DIR = Path(__file__).parent
 # CORE_SCRIPTS is either alongside the server or in the parent directory
 CORE_SCRIPTS = SCRIPT_DIR / "../core-scripts"
-if not CORE_SCRIPTS.exists():
-    CORE_SCRIPTS = SCRIPT_DIR / "core-scripts"
-
 import importlib.abc
 import hashlib
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
 from collections import deque
+
+if not CORE_SCRIPTS.exists():
+    CORE_SCRIPTS = SCRIPT_DIR / "core-scripts"
 
 # --- Layer 2: Secure Network Sandbox ---
 class NetworkSandboxFinder(importlib.abc.MetaPathFinder):
@@ -96,9 +99,8 @@ class LDPSecurityEnforcer:
 
 security_enforcer = LDPSecurityEnforcer()
 
-DISCOVERED_APPS = {} # AppName -> ConnectionHint/Descriptor
-
-# Platform Detection
+DISCOVERED_APPS = {} # name_key -> bool 
+DISCOVERED_EXPORTS = {} # export_name -> category
 PLATFORM = platform.system().lower() # 'darwin', 'linux', 'windows'
 
 SIGNAL_CONFIG = HOME / "Library/Application Support/Signal/config.json"
@@ -170,7 +172,6 @@ class ApprovalManager:
             try:
                 with open(self.approvals_file, "r") as f:
                     data = json.load(f)
-                # migrate from old string format
                 for k, v in data.items():
                     if isinstance(v, str):
                         data[k] = {
@@ -179,9 +180,13 @@ class ApprovalManager:
                             "revoked_at": None,
                             "can_retry": (v != "approved")
                         }
+                if "__app_overrides__" not in data:
+                    data["__app_overrides__"] = {}
                 self.state = data
             except:
-                self.state = {}
+                self.state = {"__app_overrides__": {}}
+        else:
+            self.state = {"__app_overrides__": {}}
 
     def save(self):
         self.approvals_file.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +195,28 @@ class ApprovalManager:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
             sys.stderr.write(f"[LDP] Error saving approvals: {e}\n")
+
+    def is_app_denied(self, app_name: str, category: str) -> bool:
+        overrides = self.state.get("__app_overrides__", {})
+        if app_name in overrides:
+            return not overrides[app_name].get("approved", True)
+        return self.is_denied(category)
+
+    def is_app_paused(self, app_name: str) -> bool:
+        overrides = self.state.get("__app_overrides__", {})
+        if app_name in overrides:
+            return overrides[app_name].get("paused", False)
+        return False
+
+    def set_app_state(self, app_name: str, approved: bool, paused: bool):
+        if "__app_overrides__" not in self.state:
+            self.state["__app_overrides__"] = {}
+        self.state["__app_overrides__"][app_name] = {
+            "approved": approved,
+            "paused": paused,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        self.save()
 
     def is_approved(self, category: str) -> bool:
         if category not in self.state: return False
@@ -743,7 +770,7 @@ def check_for_new_exports():
         "twitter": "communication"
     }
     
-    count = 0
+    # Check / Extract loop
     for path in downloads.glob("*.zip"):
         name = path.stem.lower()
         matched = None
@@ -755,30 +782,22 @@ def check_for_new_exports():
         if not matched: continue
         category = PATTERNS[matched]
         
-        if approvals.is_denied(category):
-            continue
-            
         target_dir = exports_dir / name
-        if target_dir.exists():
-            continue # already extracted
-            
-        try:
-            with zipfile.ZipFile(path, 'r') as zip_ref:
-                zip_ref.extractall(target_dir)
-            
-            # Auto-register a query tool for this export
-            tool_name = f"ldp_export_{name.replace('-','_')}_query"
-            if not any(t["name"] == tool_name for t in TOOLS):
-                TOOLS.append({
-                    "name": tool_name,
-                    "description": f"Search exported {matched} data archive.",
-                    "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}
-                })
-                # Dynamic lambda relying on generic export search (to be implemented or falls back)
-                TOOL_MAP[tool_name] = lambda a, t=target_dir: tool_export_search(t, a.get("query",""))
-            count += 1
-        except Exception as e:
-            sys.stderr.write(f"[LDP] Failed to extract {path.name}: {e}\n")
+        if not target_dir.exists():
+            try:
+                with zipfile.ZipFile(path, 'r') as zip_ref:
+                    zip_ref.extractall(target_dir)
+                sys.stderr.write(f"[LDP] Auto-extracted {path.name}\n")
+            except Exception as e:
+                sys.stderr.write(f"[LDP] Failed to extract {path.name}: {e}\n")
+                continue
+                
+        # Register in master list
+        DISCOVERED_EXPORTS[name] = category
+        
+        # Make the generic query lambda for the master tooling map
+        tool_name = f"ldp_export_{name.replace('-','_')}_query"
+        TOOL_MAP[tool_name] = lambda a, t=target_dir: tool_export_search(t, a.get("query",""))
 
 def tool_export_search(export_dir: Path, query: str = "") -> str:
     """Basic search over extracted JSON/TXT files in an export."""
@@ -1086,7 +1105,7 @@ def tool_diagnostics() -> str:
 
 # ── MCP Protocol ──────────────────────────────────────────────────
 
-TOOLS = [
+ALL_STATIC_TOOLS = [
     {"name": "ldp_diagnostics", "description": "Check LDP server status and version.", "inputSchema": {"type":"object"}},
     {"name": "ldp_check_permissions", "description": "Check Mac Full Disk Access permissions.", "inputSchema": {"type":"object"}},
     {"name": "ldp_global_search", "description": "Search across all local history/data.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
@@ -1101,6 +1120,48 @@ TOOLS = [
     {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
     {"name": "ldp_manage_approvals", "description": "Revoke, reapprove, or reset your LDP category approvals live.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string", "enum": ["revoke", "reapprove", "reset"]}, "category": {"type": "string", "description": "The category (e.g., browser, system, work) for revoke/reapprove"}}}},
 ]
+
+TOOLS = []
+
+def rebuild_tools():
+    """Live-rebuilds the TOOLS array exposed to MCP based on approvals/pauses."""
+    global TOOLS
+    new_tools = []
+    
+    STATIC_MAP = {
+        "ldp_chrome_history": "browser",
+        "ldp_shell_history": "system",
+        "ldp_claude_history": "personal",
+        "ldp_imessage_history": "communication",
+        "ldp_calendar_history": "personal",
+        "ldp_contacts_history": "communication",
+    }
+    
+    for st in ALL_STATIC_TOOLS:
+        cat = STATIC_MAP.get(st["name"], "unknown")
+        if approvals.is_app_denied(st["name"], cat) or approvals.is_app_paused(st["name"]): continue
+        new_tools.append(st)
+        
+    for name_key in DISCOVERED_APPS.keys():
+        cat = classify_app(name_key)
+        t_name = f"ldp_{name_key}_query"
+        if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
+        new_tools.append({
+            "name": t_name,
+            "description": f"Query {name_key} local database...",
+            "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}, "limit": {"type":"integer", "default": 10}}}
+        })
+        
+    for name_key, cat in DISCOVERED_EXPORTS.items():
+        t_name = f"ldp_export_{name_key.replace('-','_')}_query"
+        if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
+        new_tools.append({
+            "name": t_name,
+            "description": f"Search exported data archive.",
+            "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}
+        })
+        
+    TOOLS[:] = new_tools
 
 TOOL_MAP = {
     "ldp_diagnostics": lambda a: tool_diagnostics(),
@@ -1118,34 +1179,156 @@ TOOL_MAP = {
     "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
 }
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+        
+    def do_GET(self):
+        if self.path == "/api/state":
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            d_state = { "tools": {} }
+            STATIC_MAP = {
+                "ldp_chrome_history": "browser", "ldp_shell_history": "system", "ldp_claude_history": "personal",
+                "ldp_imessage_history": "communication", "ldp_calendar_history": "personal", "ldp_contacts_history": "communication",
+            }
+            
+            def add_tool_state(name, cat):
+                d_state["tools"][name] = {
+                    "name": name, "category": cat,
+                    "approved": not approvals.is_app_denied(name, cat),
+                    "paused": approvals.is_app_paused(name)
+                }
+                
+            for st in ALL_STATIC_TOOLS: add_tool_state(st["name"], STATIC_MAP.get(st["name"], "unknown"))
+            for name_key in DISCOVERED_APPS.keys(): add_tool_state(f"ldp_{name_key}_query", classify_app(name_key))
+            for name_key, cat in DISCOVERED_EXPORTS.items(): add_tool_state(f"ldp_export_{name_key.replace('-','_')}_query", cat)
+            
+            self.wfile.write(json.dumps(d_state).encode())
+            
+        elif self.path == "/":
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            html = """<!DOCTYPE html>
+<html><head><title>LDP Dashboard</title>
+<style>
+    body { font-family: system-ui, sans-serif; background: #0a0a0a; color: #eee; max-width: 800px; margin: 40px auto; }
+    .tool-row { display: flex; justify-content: space-between; align-items: center; padding: 18px; background: #161616; margin-bottom: 12px; border-radius: 8px; border: 1px solid #333; }
+    .tool-name { font-weight: 600; font-size: 17px; }
+    .tool-cat { font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; }
+    .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 13px; margin-left: 8px; transition: 0.1s opacity; }
+    .btn:hover { opacity: 0.8; }
+    .btn-on { background: #1ecc66; color: #000; }
+    .btn-off { background: #ff4b4b; color: #fff; }
+    .btn-pause { background: #f1c40f; color: #000; }
+    .btn-orange { background: #e67e22; color: #fff; }
+    .status { margin-right: 20px; font-weight: 700; font-size: 14px; display: inline-block; width: 100px; text-align: right; }
+    .on-text { color: #1ecc66; }
+    .off-text { color: #ff4b4b; }
+    .paused-text { color: #f1c40f; }
+</style>
+</head><body>
+    <h1 style="margin-bottom:5px;">LDP Dashboard</h1>
+    <p style="color:#888; margin-bottom: 30px;">Manage your local standard connectors live.</p>
+    <div id="tools"></div>
+    <script>
+        async function fetchState() {
+            const res = await fetch('/api/state');
+            const data = await res.json();
+            const container = document.getElementById('tools');
+            container.innerHTML = '';
+            
+            for (const [name, info] of Object.entries(data.tools)) {
+                let statusText = '<span class="status on-text">ON ●</span>';
+                let actionBtns = `
+                    <button class="btn btn-pause" onclick="toggle('${name}', true, true)">PAUSE ⏸</button>
+                    <button class="btn btn-off" onclick="toggle('${name}', false, false)">REVOKE ⨉</button>
+                `;
+                
+                if (!info.approved) {
+                    statusText = '<span class="status off-text">OFF ○</span>';
+                    actionBtns = `<button class="btn btn-orange" onclick="toggle('${name}', true, false)">Re-enable?</button>`;
+                } else if (info.paused) {
+                    statusText = '<span class="status paused-text">PAUSED ⏸</span>';
+                    actionBtns = `
+                        <button class="btn btn-on" onclick="toggle('${name}', true, false)">RESUME ▶</button>
+                        <button class="btn btn-off" onclick="toggle('${name}', false, false)">REVOKE ⨉</button>
+                    `;
+                }
+                
+                const pretty = name.replace('ldp_', '').replace('_query', '').replace('_history', '').replace(/_/g, ' ');
+                const prettyUpper = pretty.charAt(0).toUpperCase() + pretty.slice(1);
+                
+                const row = document.createElement('div');
+                row.className = 'tool-row';
+                if (!info.approved) row.style.opacity = '0.5';
+                
+                row.innerHTML = `
+                    <div>
+                        <div class="tool-name">${prettyUpper}</div>
+                        <div class="tool-cat">${info.category}</div>
+                    </div>
+                    <div style="display:flex; align-items:center;">
+                        ${statusText}
+                        ${actionBtns}
+                    </div>
+                `;
+                container.appendChild(row);
+            }
+        }
+        
+        async function toggle(name, approved, paused) {
+            await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name, approved, paused}) });
+            fetchState();
+        }
+        setInterval(fetchState, 3000);
+        fetchState();
+    </script>
+</body></html>"""
+            self.wfile.write(html.encode())
+
+    def do_POST(self):
+        if self.path == "/api/toggle":
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length).decode())
+            approvals.set_app_state(data.get("name"), data.get("approved", True), data.get("paused", False))
+            rebuild_tools()
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok"}')
+
+def start_dashboard_server():
+    try:
+        server = HTTPServer(('127.0.0.1', 8765), DashboardHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        sys.stderr.write("[LDP] Dashboard hosted on http://localhost:8765\n")
+    except Exception as e:
+        sys.stderr.write(f"[LDP] Dashboard server failed to bind: {e}\n")
+
 def main():
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")
+    start_dashboard_server()
+
     
     approvals.run_first_run_approvals()
-    
-    # Static tools auto-filtering based on persistent approvals
-    global TOOLS
-    tools_to_keep = []
-    STATIC_MAP = {
-        "ldp_chrome_history": "browser",
-        "ldp_shell_history": "system",
-        "ldp_claude_history": "personal",
-        "ldp_imessage_history": "communication",
-        "ldp_calendar_history": "personal",
-        "ldp_contacts_history": "communication",
-    }
-    for t in TOOLS:
-        t_name = t["name"]
-        if t_name in STATIC_MAP and approvals.is_denied(STATIC_MAP[t_name]):
-            continue
-        tools_to_keep.append(t)
-    TOOLS[:] = tools_to_keep
 
     # Run Export Watcher ingestion at startup
     check_for_new_exports()
 
-    # Run discovery at startup to populate dynamic TOOLS
+    # Run discovery at startup to populate DISCOVERED_APPS
     tool_discover_apps(at_startup=True)
+    
+    # Compile the live list of valid apps exposed to AI
+    rebuild_tools()
     
     sys.stderr.write("[LDP] Dynamic Server Ready\n")
     for line in sys.stdin:
