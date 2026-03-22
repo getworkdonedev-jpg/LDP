@@ -62,6 +62,8 @@ export interface ScannedFile {
   confidence: number;
   tables:     string[];
   encrypted:  boolean;
+  totalRows:  number;
+  maxRows:    number;
 }
 
 export interface ProcessInfo {
@@ -126,6 +128,7 @@ const SKIP_PATH_PATTERNS = [
   "/System/","/usr/","/private/var/","/Library/Caches/","/Library/Logs/",
   "/.Spotlight-","/CoreData/","metadata.sqlite","CloudKitLocalStore",
   "com.apple.bird","CoreDataUbiquitySupport",
+  "StoreKit.db", "DriveFS/root_preference_sqlite.db",
 ];
 
 const DATA_EXTS = new Set([".db",".sqlite",".sqlite3",".db3",".vscdb",".json",".csv"]);
@@ -183,13 +186,15 @@ function walk(
       if (files >= max) break;
       const fp = path.join(dir, e.name);
       if (e.isDirectory()) { if (!shouldSkip(e.name, fp)) recurse(fp, depth+1); continue; }
-      if (!e.isFile()) continue;
-      if (!DATA_EXTS.has(path.extname(e.name).toLowerCase())) continue;
-      let stat: fs.Stats;
-      try { stat = fs.statSync(fp); } catch { continue; }
-      if (stat.size < 512 || stat.size > 500*1024*1024) continue;
-      files++;
-      cb(fp, stat);
+      if (e.isFile()) {
+        if (shouldSkip(e.name, fp)) continue;
+        if (!DATA_EXTS.has(path.extname(e.name).toLowerCase())) continue;
+        let stat: fs.Stats;
+        try { stat = fs.statSync(fp); } catch { continue; }
+        if (stat.size < 512 || stat.size > 500*1024*1024) continue;
+        files++;
+        cb(fp, stat);
+      }
     }
   }
 
@@ -264,6 +269,25 @@ function readTables(fp: string): string[] {
   } catch { return []; }
 }
 
+function readDensity(fp: string, tables: string[]): { total: number, max: number } {
+  if (tables.length === 0) return { total: 0, max: 0 };
+  let total = 0;
+  let max = 0;
+  try {
+    const DB = require("better-sqlite3");
+    const db = new DB(fp, { readonly: true, timeout: 2000 });
+    for (const t of tables.slice(0, 10)) {
+      try {
+        const res = db.prepare(`SELECT count(*) as count FROM "${t}"`).get() as { count: number };
+        total += res.count;
+        if (res.count > max) max = res.count;
+      } catch {}
+    }
+    db.close();
+  } catch {}
+  return { total, max };
+}
+
 function readColumns(fp: string, tables: string[]): string[] {
   const cols: string[] = [];
   try {
@@ -295,18 +319,20 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType): Promise<Sc
   const base: ScannedFile = {
     filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
     appName: path.basename(fp), category: "other", confidence: 0.1,
-    tables: [], encrypted: ft === "sqlcipher",
+    tables: [], encrypted: ft === "sqlcipher", totalRows: 0, maxRows: 0,
   };
 
   const pm = identifyFromPath(fp);
-  if (pm) return { ...base, appName: pm.app, category: pm.cat, confidence: pm.conf };
+  const tables = (ft === "sqlite" || ft === "sqlcipher") ? readTables(fp) : [];
+  const density = ft === "sqlite" ? readDensity(fp, tables) : { total: 0, max: 0 };
+
+  if (pm) return { ...base, appName: pm.app, category: pm.cat, confidence: pm.conf, tables, totalRows: density.total, maxRows: density.max };
 
   if (ft === "sqlite") {
-    const tables  = readTables(fp);
     const columns = readColumns(fp, tables);
     const sm = identifyFromSchema(tables, columns);
-    if (sm) return { ...base, tables, appName: sm.app, category: sm.cat, confidence: sm.conf };
-    return { ...base, tables, confidence: tables.length > 0 ? 0.3 : 0.1 };
+    if (sm) return { ...base, tables, appName: sm.app, category: sm.cat, confidence: sm.conf, totalRows: density.total, maxRows: density.max };
+    return { ...base, tables, totalRows: density.total, maxRows: density.max, confidence: tables.length > 0 ? 0.3 : 0.1 };
   }
 
   if (ft === "json" || ft === "csv") {
@@ -466,6 +492,8 @@ export class SystemScanner {
             appName: known.appName, category: known.category,
             confidence: Math.min(known.confidence + 0.05, 1.0),
             tables: Object.keys(known.schema), encrypted: known.method !== "plain_sqlite",
+            totalRows: (known as any).totalRows ?? 0,
+            maxRows: (known as any).maxRows ?? 0,
           } as ScannedFile;
         }
         return analyseFile(fp, stat, ft);
@@ -474,14 +502,31 @@ export class SystemScanner {
       for (const scanned of analysed) {
         if (!scanned) { result.skipped++; continue; }
 
+        // Density Rules:
+        // 1. Zero rows -> ignore
+        // 2. < 10 total rows -> low priority, skip auto-register
+        // 3. at least one table > 10 rows -> auto-register candidate
+        if (scanned.fileType === "sqlite" && scanned.totalRows === 0) {
+          if (this.opts.verbose) console.log(`[SCAN] Skipping empty DB: ${scanned.appName}`);
+          result.skipped++;
+          continue;
+        }
+
         if (scanned.fileType === "sqlite" || scanned.fileType === "sqlcipher") {
           result.databases.push(scanned);
         } else {
           result.dataFiles.push(scanned);
         }
 
+        const isLowPriority = scanned.fileType === "sqlite" && scanned.totalRows < 10;
+        const canAutoRegister = scanned.fileType !== "sqlite" || scanned.maxRows > 10;
+
+        if (isLowPriority && this.opts.verbose) {
+          console.log(`[SCAN] Low priority (total rows ${scanned.totalRows}): ${scanned.appName}`);
+        }
+
         // Auto-connect high-confidence non-encrypted files
-        if (scanned.confidence >= threshold && this.opts.engine && !scanned.encrypted) {
+        if (scanned.confidence >= threshold && this.opts.engine && !scanned.encrypted && !isLowPriority && canAutoRegister) {
           const connector = buildConnector(scanned);
           const name = connector.descriptor.name;
           if (!result.autoConnected.includes(name)) {
@@ -494,6 +539,8 @@ export class SystemScanner {
                 filePath: scanned.filePath, appName: scanned.appName,
                 category: scanned.category, method: "plain_sqlite",
                 schema: {}, confidence: scanned.confidence,
+                totalRows: scanned.totalRows,
+                maxRows: scanned.maxRows,
               });
               if (this.opts.verbose) console.log(`[SCAN] ✓ auto-connected: ${scanned.appName} (${(scanned.confidence*100).toFixed(0)}%)`);
             }
@@ -501,7 +548,10 @@ export class SystemScanner {
         } else if (scanned.confidence >= 0.5 && scanned.confidence < threshold) {
           result.pendingApproval.push(scanned);
         } else {
-          result.skipped++;
+          // If it didn't auto-connect and wasn't pending approval, it's skipped
+          if (scanned.confidence < 0.5 || isLowPriority || !canAutoRegister) {
+            result.skipped++;
+          }
         }
       }
     }

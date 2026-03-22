@@ -18,6 +18,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { ConnectorDescriptor, BaseConnector, Row, SchemaMap } from "./types.js";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -258,6 +261,7 @@ const DEFAULT_SKIP = [
   "CrashpadMetrics", "pnacl", "Crashpad",
   "System Preferences", "CoreServicesUIAgent",
   ".Trash", "Logs", "logs", "tmp", "temp",
+  "StoreKit.db", "DriveFS/root_preference_sqlite.db",
 ];
 
 // ── SQLite schema reader (pure Node.js, no native deps) ──────────────────────
@@ -311,6 +315,46 @@ function readSQLiteSchema(filePath: string): RawSchema | null {
   }
 }
 
+function getDatabaseDensity(filePath: string, tableNames: string[]): { total: number, max: number } {
+  let total = 0;
+  let max = 0;
+  let db: any;
+  let tmpPath: string | null = null;
+
+  try {
+    const DB = require("better-sqlite3");
+    
+    // If it is a Chrome/Brave history file it is often locked, so we copy it
+    if (filePath.includes("History") || filePath.includes("Login Data")) {
+      tmpPath = path.join(os.tmpdir(), `ldp_tmp_${Math.random().toString(36).slice(2)}.db`);
+      fs.copyFileSync(filePath, tmpPath);
+      db = new DB(tmpPath, { readonly: true, timeout: 2000 });
+    } else {
+      db = new DB(filePath, { readonly: true, timeout: 2000 });
+    }
+
+    let actualTables = tableNames;
+    if (actualTables.length === 0) {
+      const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 20").all();
+      actualTables = rows.map((r: any) => r.name);
+    }
+
+    for (const t of actualTables.slice(0, 15)) {
+      try {
+        const res = db.prepare(`SELECT count(*) as count FROM "${t}"`).get() as { count: number };
+        total += res.count;
+        if (res.count > max) max = res.count;
+      } catch {}
+    }
+  } catch (e: any) {
+    // console.warn(`[LDP AutoGen] Density check failed for ${filePath}:`, e.message);
+  } finally {
+    if (db) try { db.close(); } catch {}
+    if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
+  }
+  return { total, max };
+}
+
 // ── File scanner ─────────────────────────────────────────────────────────────
 
 function scanForDatabases(
@@ -344,16 +388,21 @@ function scanForDatabases(
       }
 
       // SQLite files
-      if (entry.isFile() && (
-        lname.endsWith(".db") ||
-        lname.endsWith(".sqlite") ||
-        lname.endsWith(".sqlite3") ||
-        lname === "history" ||
-        lname === "places.sqlite" ||
-        lname === "cookies" ||
-        lname === "web data"
-      )) {
-        found.push(fullPath);
+      if (entry.isFile()) {
+        if (skipPatterns.some(p => fullPath.includes(p))) continue;
+        if (
+          lname.endsWith(".db") ||
+          lname.endsWith(".sqlite") ||
+          lname.endsWith(".sqlite3") ||
+          lname.endsWith(".vscdb") ||
+          lname.endsWith(".db3") ||
+          lname === "history" ||
+          lname === "places.sqlite" ||
+          lname === "cookies" ||
+          lname === "web data"
+        ) {
+          found.push(fullPath);
+        }
       }
     }
   }
@@ -548,6 +597,21 @@ export class AutoConnectorGenerator {
       try {
         const result = await this.generateForFile(filePath);
         if (!result) continue;
+
+        // Density Rules:
+        // Rule 3: total < 10 -> low priority, no auto-register
+        // Rule 4: at least one table > 10 -> auto-register
+        const hints = result.descriptor.connectionHints as any;
+        const totalRows = hints?.totalRows ?? 0;
+        const maxRows = hints?.maxRows ?? 0;
+        const isLowPriority = totalRows < 10;
+        const canAutoRegister = maxRows > 10 || result.method === "known-app";
+
+        if (isLowPriority) {
+          console.log(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
+          continue; 
+        }
+
         if (result.confidence < 0.3) continue; // skip very uncertain
         if (seen.has(result.descriptor.app)) continue; // one connector per app
         seen.add(result.descriptor.app);
@@ -566,9 +630,13 @@ export class AutoConnectorGenerator {
    * Returns null if the file is not a recognisable database.
    */
   async generateForFile(filePath: string): Promise<AutoGenResult | null> {
-    // 1. Try known fingerprint first (instant, no AI)
+    // 1. Try known fingerprint (instant, no AI)
     const fp = identifyByFingerprint(filePath);
     if (fp) {
+      const schema = readSQLiteSchema(filePath);
+      const tableNames = schema?.tables.map(t => t.name) ?? [];
+      const density = getDatabaseDensity(filePath, tableNames);
+
       const descriptor: ConnectorDescriptor = {
         name: fp.app.toLowerCase().replace(/\s+/g, "_"),
         app: fp.app,
@@ -577,6 +645,12 @@ export class AutoConnectorGenerator {
         permissions: fp.permissions,
         namedQueries: fp.namedQueries,
         description: `Auto-detected ${fp.app} ${fp.category} database`,
+        connectionHints: {
+          totalRows: density.total,
+          maxRows: density.max,
+          isLowPriority: density.total > 0 && density.total < 10,
+          canAutoRegister: density.max > 10 || density.total === 0 // If encrypted (0 rows detected), allow auto-register
+        } as any
       };
       return {
         descriptor,
@@ -587,9 +661,23 @@ export class AutoConnectorGenerator {
       };
     }
 
-    // 2. Read schema
+    // 2. Read schema & Density
     const schema = readSQLiteSchema(filePath);
     if (!schema || schema.tables.length === 0) return null;
+
+    const tableNames = schema.tables.map(t => t.name);
+    const density = getDatabaseDensity(filePath, tableNames);
+
+    if (density.total === 0) {
+      return null;
+    }
+
+    const hints = { 
+      totalRows: density.total,
+      maxRows: density.max,
+      isLowPriority: density.total < 10,
+      canAutoRegister: density.max > 10
+    };
 
     // 3. Try AI analysis
     if (this.opts.apiKey) {
@@ -602,7 +690,8 @@ export class AutoConnectorGenerator {
           dataPaths: [filePath],
           permissions: ai.permissions,
           namedQueries: ai.namedQueries,
-          description: ai.description,
+          description: ai.description ?? `Auto-scanned ${ai.appName} database`,
+          connectionHints: hints as any
         };
         return {
           descriptor,
@@ -613,7 +702,6 @@ export class AutoConnectorGenerator {
         };
       }
     }
-
     // 4. Heuristic fallback — use table/column names to guess
     const heuristic = heuristicAnalyse(filePath, schema);
     if (heuristic && heuristic.confidence >= 0.35) {
@@ -625,6 +713,7 @@ export class AutoConnectorGenerator {
         permissions: heuristic.permissions,
         namedQueries: heuristic.namedQueries,
         description: heuristic.description,
+        connectionHints: hints as any
       };
       return {
         descriptor,

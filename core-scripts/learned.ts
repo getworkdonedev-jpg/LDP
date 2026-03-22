@@ -72,6 +72,10 @@ export interface LearnedApp {
   schema:         Record<string, string[]>;
   /** 0–1 confidence in the identification */
   confidence:     number;
+  /** Total rows found in database */
+  totalRows?:     number;
+  /** Maximum rows in any single table */
+  maxRows?:       number;
   /** Unix timestamp of first identification */
   firstSeen:      number;
   /** Last time this app was successfully connected */
@@ -166,6 +170,8 @@ export class LearnedBase {
     params?:    Record<string, unknown>;
     schema?:    Record<string, string[]>;
     confidence: number;
+    totalRows?: number;
+    maxRows?:   number;
   }): LearnedApp {
     const appKey  = makeAppKey(info.filePath);
     const existing = this.apps.get(appKey);
@@ -180,6 +186,8 @@ export class LearnedBase {
       params:         info.params ?? {},
       schema:         info.schema ?? {},
       confidence:     info.confidence,
+      totalRows:      info.totalRows ?? existing?.totalRows ?? 0,
+      maxRows:        info.maxRows   ?? existing?.maxRows   ?? 0,
       firstSeen:      existing?.firstSeen ?? now,
       lastConnected:  now,
       timesConnected: (existing?.timesConnected ?? 0) + 1,

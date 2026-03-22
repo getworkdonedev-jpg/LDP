@@ -43,6 +43,7 @@ export interface KnownSolution {
   filePath:     string;
   method:       DecryptMethod;
   params:       Record<string, unknown>;
+  totalRows?:   number;
   solvedAt:     number;
   solvedOnOS:   string;
   successCount: number;
@@ -329,7 +330,7 @@ export class DecryptionBrain {
       if (r.success) {
         if (verbose) console.log(`[BRAIN] ✓ Solved: ${appName} → ${s.method}`);
         const appKey = `${appName.toLowerCase().replace(/\s+/g,"_")}_${os.platform()}`;
-        this.kb.learn({ appKey, appName, filePath, method: s.method, params: r.key ? { key: r.key } : {} });
+        this.kb.learn({ appKey, appName, filePath, method: s.method, params: r.key ? { key: r.key } : {}, totalRows: r.rowCount });
         if (s.method === "plain_sqlite") return null;
         return { method: s.method, key: r.key };
       }
