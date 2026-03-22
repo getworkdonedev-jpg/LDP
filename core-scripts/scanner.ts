@@ -273,18 +273,27 @@ function readDensity(fp: string, tables: string[]): { total: number, max: number
   if (tables.length === 0) return { total: 0, max: 0 };
   let total = 0;
   let max = 0;
+  let db: any;
+  let tmpPath: string | null = null;
   try {
     const DB = require("better-sqlite3");
-    const db = new DB(fp, { readonly: true, timeout: 2000 });
-    for (const t of tables.slice(0, 10)) {
+    
+    // Always use a temp copy for density check to avoid locks from running apps
+    tmpPath = path.join(os.tmpdir(), `ldp_scan_${Math.random().toString(36).slice(2)}.db`);
+    fs.copyFileSync(fp, tmpPath);
+    db = new DB(tmpPath, { readonly: true, timeout: 2000 });
+
+    for (const t of tables.slice(0, 15)) {
       try {
         const res = db.prepare(`SELECT count(*) as count FROM "${t}"`).get() as { count: number };
         total += res.count;
         if (res.count > max) max = res.count;
       } catch {}
     }
-    db.close();
-  } catch {}
+  } catch {} finally {
+    if (db) try { db.close(); } catch {}
+    if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
+  }
   return { total, max };
 }
 
@@ -520,13 +529,21 @@ export class SystemScanner {
 
         const isLowPriority = scanned.fileType === "sqlite" && scanned.totalRows < 10;
         const canAutoRegister = scanned.fileType !== "sqlite" || scanned.maxRows > 10;
+        
+        // Whitelist high-value known sources: bypass density skip
+        const isWhitelisted = scanned.appName === "Google Chrome" || 
+                              scanned.appName === "Signal" || 
+                              scanned.confidence >= 0.8;
 
-        if (isLowPriority && this.opts.verbose) {
+        if (isLowPriority && this.opts.verbose && !isWhitelisted) {
           console.log(`[SCAN] Low priority (total rows ${scanned.totalRows}): ${scanned.appName}`);
         }
 
-        // Auto-connect high-confidence non-encrypted files
-        if (scanned.confidence >= threshold && this.opts.engine && !scanned.encrypted && !isLowPriority && canAutoRegister) {
+        // Auto-connect high-confidence files
+        // We bypass density checks IF whitelisted (e.g. Chrome/Signal)
+        const densityMatch = (!isLowPriority && canAutoRegister) || isWhitelisted;
+
+        if (scanned.confidence >= threshold && this.opts.engine && !scanned.encrypted && densityMatch) {
           const connector = buildConnector(scanned);
           const name = connector.descriptor.name;
           if (!result.autoConnected.includes(name)) {

@@ -324,14 +324,10 @@ function getDatabaseDensity(filePath: string, tableNames: string[]): { total: nu
   try {
     const DB = require("better-sqlite3");
     
-    // If it is a Chrome/Brave history file it is often locked, so we copy it
-    if (filePath.includes("History") || filePath.includes("Login Data")) {
-      tmpPath = path.join(os.tmpdir(), `ldp_tmp_${Math.random().toString(36).slice(2)}.db`);
-      fs.copyFileSync(filePath, tmpPath);
-      db = new DB(tmpPath, { readonly: true, timeout: 2000 });
-    } else {
-      db = new DB(filePath, { readonly: true, timeout: 2000 });
-    }
+    // Always use a temp copy for density check to avoid locks from running apps
+    tmpPath = path.join(os.tmpdir(), `ldp_auto_${Math.random().toString(36).slice(2)}.db`);
+    fs.copyFileSync(filePath, tmpPath);
+    db = new DB(tmpPath, { readonly: true, timeout: 2000 });
 
     let actualTables = tableNames;
     if (actualTables.length === 0) {
@@ -604,10 +600,17 @@ export class AutoConnectorGenerator {
         const hints = result.descriptor.connectionHints as any;
         const totalRows = hints?.totalRows ?? 0;
         const maxRows = hints?.maxRows ?? 0;
-        const isLowPriority = totalRows < 10;
-        const canAutoRegister = maxRows > 10 || result.method === "known-app";
+        
+        // Whitelist high-value known sources
+        const isWhitelisted = result.descriptor.app === "Google Chrome" || 
+                              result.descriptor.app === "Signal" || 
+                              result.confidence >= 0.8 ||
+                              result.method === "known-app";
 
-        if (isLowPriority) {
+        const isLowPriority = totalRows < 10;
+        const canAutoRegister = maxRows > 10 || isWhitelisted;
+
+        if (isLowPriority && !isWhitelisted) {
           console.log(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
           continue; 
         }
