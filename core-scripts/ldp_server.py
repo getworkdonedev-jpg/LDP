@@ -199,72 +199,153 @@ def tool_shell_history(limit: int = 50) -> str:
             except: continue
     return "No shell history found."
 
-def tool_discover_apps(at_startup: bool = False) -> str:
-    """Run the TypeScript auto-connector to find and identify local databases."""
+def count_db_rows(db_path: Path) -> int:
+    """Count total rows across all tables in a SQLite db using a temp copy."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    total = 0
     try:
-        # Use run-auto.ts for the latest v2.0 logic, but fallback to auto-connector if needed
-        script = CORE_SCRIPTS / "auto-connector.ts"
-        if not script.exists():
-            return "Discovery failed: TypeScript source not found."
-            
-        result = subprocess.run(
-            ["npx", "tsx", str(script), "--json"],
-            capture_output=True, text=True, timeout=60, cwd=str(CORE_SCRIPTS)
-        )
-        if result.returncode != 0:
-            return f"Discovery failed: {result.stderr}"
-        
-        # Parse JSON output
-        try:
-            apps = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return f"Discovery failed: Invalid JSON output from scanner."
+        shutil.copy2(str(db_path), tmp.name)
+        con = sqlite3.connect(tmp.name)
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        for tbl in tables:
+            try:
+                row = con.execute(f"SELECT count(*) FROM \"{tbl}\"").fetchone()
+                if row: total += row[0]
+            except: pass
+        con.close()
+    except: pass
+    finally:
+        try: os.unlink(tmp.name)
+        except: pass
+    return total
 
-        if not apps:
-            return "No new apps found."
-        
-        count = 0
-        for a in apps:
-            if not isinstance(a, dict): continue
-            desc = a.get("descriptor", {})
-            if not isinstance(desc, dict): continue
-            
-            name = str(desc.get("app", "Unknown"))
-            name_key = str(desc.get("name", name.lower().replace(" ", "_")))
-            
-            # CRITICAL: Do not add Signal as a default tool (user approval required)
-            if "signal" in name_key.lower() and at_startup:
-                DISCOVERED_APPS[name_key.lower()] = a
-                continue
+def max_table_rows(db_path: Path) -> tuple:
+    """Return (max_rows, table_count) from the db (temp-copy safe)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    max_rows = 0
+    table_count = 0
+    try:
+        shutil.copy2(str(db_path), tmp.name)
+        con = sqlite3.connect(tmp.name)
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        table_count = len(tables)
+        for tbl in tables:
+            try:
+                row = con.execute(f"SELECT count(*) FROM \"{tbl}\"").fetchone()
+                if row and row[0] > max_rows: max_rows = row[0]
+            except: pass
+        con.close()
+    except: pass
+    finally:
+        try: os.unlink(tmp.name)
+        except: pass
+    return (max_rows, table_count)
 
-            # Register app in global state
-            DISCOVERED_APPS[name_key.lower()] = a
-            
-            # Dynamically add to TOOLS if not already present
-            tool_name = f"ldp_{name_key.lower()}_query"
-            if not any(t["name"] == tool_name for t in TOOLS):
-                TOOLS.append({ # type: ignore
-                    "name": tool_name,
-                    "description": f"Query {name} data. {desc.get('description', '')}",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Optional SQL query. Leave empty for smart defaults."},
-                            "limit": {"type": "integer", "default": 10}
-                        }
-                    }
-                })
-                # Use a closure helper to capture name_key correctly
-                def create_handler(nk):
-                    return lambda args: tool_query_app(nk, args.get("query", ""), args.get("limit", 10))
-                TOOL_MAP[tool_name] = create_handler(name_key) # type: ignore
-                count = count + 1
-        
-        if at_startup:
-            return f"Synchronized {count} apps."
-        return f"Discovered {count} new apps and registered them as tools."
+# Paths/patterns to skip during full walk
+WALK_SKIP_PATTERNS = [
+    "Cache", "cache", ".enc", "StoreKit", "root_preference_sqlite",
+    "WebKit", "GPUCache", "ShaderCache", "blob_storage", "IndexedDB",
+    "Service Worker", "Code Cache", "first_party_sets",
+    "com.apple.ProtectedCloudStorage", "com.apple.akd",
+    "networkserviceproxy", "videosubscriptionsd", "RemoteManagement",
+    ".macromedia", "Cookies",
+]
+
+def tool_discover_apps(at_startup: bool = False) -> str:
+    """Walk ALL of ~/Library/Application Support for .sqlite/.db files and register
+    any database with at least one table having more than 10 rows as an LDP tool."""
+    search_root = HOME / "Library" / "Application Support"
+    extensions = {".sqlite", ".db"}
+    
+    # Signal is known but requires consent — never auto-register
+    CONSENT_REQUIRED = {"signal", "whatsapp", "telegram"}
+
+    found_paths: List[Path] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(str(search_root)):
+            # Prune skip dirs in-place so os.walk doesn't descend into them
+            dirnames[:] = [d for d in dirnames if not any(s.lower() in d.lower() for s in WALK_SKIP_PATTERNS)]
+            for fname in filenames:
+                if any(s.lower() in fname.lower() for s in WALK_SKIP_PATTERNS):
+                    continue
+                if Path(fname).suffix.lower() in extensions:
+                    found_paths.append(Path(dirpath) / fname)
     except Exception as e:
-        return f"Error during discovery: {e}"
+        sys.stderr.write(f"[LDP] Walk error: {e}\n")
+
+    count = 0
+    skipped_consent = 0
+    low_density = 0
+    results = []
+
+    for db_path in found_paths:
+        # Derive a friendly name — walk up the path for a meaningful folder name
+        parts = list(db_path.parts)
+        # Start from parent, skip generic folders and numeric IDs
+        GENERIC = {"databases", "sql", "data", "db", "appdata", "storage", "plugin_config", "partitions", "webex", "plugins"}
+        app_name = None
+        for part in reversed(parts[:-1]):  # skip the file itself
+            if part.lower() in GENERIC: continue
+            if part.isnumeric() or (len(part) > 20 and part.replace("-", "").isalnum()): continue
+            if part.lower().startswith("profile ") or part.lower() in ("default", "guest profile", "system profile"): continue
+            if part.lower() in ("library", "application support", "users"): break
+            app_name = part
+            break
+        if not app_name:
+            # Last resort: use db filename without extension
+            app_name = db_path.stem
+        name_key = app_name.lower().replace(" ", "_").replace(".", "_").replace("-", "_")
+        tool_name = f"ldp_{name_key}_query"
+
+        # Skip apps requiring consent (Signal etc)
+        if any(c in name_key for c in CONSENT_REQUIRED):
+            skipped_consent += 1
+            DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "requiresConsent": True}
+            continue
+
+        # Density check — skip if max rows <= 10 AND fewer than 5 tables
+        try:
+            peak, table_count = max_table_rows(db_path)
+        except:
+            peak, table_count = 0, 0
+
+        if peak <= 10 and table_count < 5:
+            low_density += 1
+            continue
+
+        # Register app
+        DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "peak_rows": peak}
+
+        if not any(t["name"] == tool_name for t in TOOLS): # type: ignore
+            TOOLS.append({ # type: ignore
+                "name": tool_name,
+                "description": f"Query {app_name} local database ({db_path.name}, {peak} max rows in a table)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Optional SQL query. Leave empty for schema overview."},
+                        "limit": {"type": "integer", "default": 10}
+                    }
+                }
+            })
+            def create_handler(nk, path):
+                def handler(args):
+                    q = args.get("query", "")
+                    lim = args.get("limit", 10)
+                    if not q:
+                        q = f"SELECT name, type FROM sqlite_master WHERE type='table' LIMIT {lim}"
+                    return json.dumps(read_sqlite(path, q), indent=2)
+                return handler
+            TOOL_MAP[tool_name] = create_handler(name_key, db_path) # type: ignore
+            count += 1
+            results.append(f"  ✓ {app_name} ({db_path.name}, {peak} rows)")
+
+    summary = f"Full walk complete: {count} new apps registered, {skipped_consent} deferred (consent required), {low_density} skipped (low density)."
+    if results:
+        summary += "\n\nRegistered:\n" + "\n".join(results)
+    return summary
 
 def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
     """Dynamically query a discovered app. Handles decryption automatically."""
