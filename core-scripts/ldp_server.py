@@ -64,6 +64,102 @@ def get_platform_paths():
 
 PLATFORM_PATHS = get_platform_paths()
 
+# ── Approval Management ──────────────────────────────────────────
+
+CATEGORY_MAP = {
+    "browser":       ["chrome", "brave", "firefox", "safari", "edge", "arc"],
+    "communication": ["signal", "whatsapp", "imessage", "telegram", "messages"],
+    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm"],
+    "personal":      ["claude", "spotify", "notes", "calendar", "animoji", "photos"],
+    "system":        ["shell", "dock", "system", "kernel", "drivefs", "tipkit", "coredatabackend"],
+}
+
+def classify_app(name_key: str) -> str:
+    """Map a normalized app name key to a category."""
+    for cat, keywords in CATEGORY_MAP.items():
+        if any(kw in name_key for kw in keywords):
+            return cat
+    return "unknown"
+
+class ApprovalManager:
+    def __init__(self):
+        self.approvals_file = HOME / ".ldp" / "approvals.json"
+        self.state = {}
+        self.load()
+
+    def load(self):
+        if self.approvals_file.exists():
+            try:
+                with open(self.approvals_file, "r") as f:
+                    self.state = json.load(f)
+            except:
+                self.state = {}
+
+    def save(self):
+        self.approvals_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self.approvals_file, "w") as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            sys.stderr.write(f"[LDP] Error saving approvals: {e}\n")
+
+    def is_approved(self, category: str) -> bool:
+        return self.state.get(category) == "approved"
+
+    def is_denied(self, category: str) -> bool:
+        return self.state.get(category) == "denied"
+
+    def has_asked(self, category: str) -> bool:
+        return category in self.state
+
+    def request(self, category: str, auto_save: bool = True) -> str:
+        """Prompt user via macOS dialog and store result."""
+        # Only works on macOS for now
+        if PLATFORM != "darwin":
+            self.state[category] = "approved"
+            if auto_save: self.save()
+            return "approved"
+
+        cat_names = {
+            "browser": "Browser Data (Chrome, Safari, Edge)",
+            "communication": "Communication (Signal, WhatsApp, iMessage)",
+            "work": "Work Tools (Zoom, Slack, VS Code)",
+            "personal": "Personal (Claude, Notes, Spotify)",
+            "system": "System (Shell, Dock, OS cache)",
+        }
+        friendly_name = cat_names.get(category, f"'{category}' apps")
+
+        apple_script = f'''
+        display dialog "LDP wants to access your local {friendly_name}. Allow access?" ¬
+        buttons {{"Deny", "Allow"}} default button "Allow" with title "LDP Connector" with icon caution
+        '''
+        
+        try:
+            res = subprocess.run(["osascript", "-e", apple_script], capture_output=True, text=True)
+            if "Allow" in res.stdout:
+                status = "approved"
+            else:
+                status = "denied"
+        except:
+            status = "denied"  # fail closed
+
+        self.state[category] = status
+        if auto_save:
+            self.save()
+        return status
+
+    def run_first_run_approvals(self):
+        """Check all standard categories and prompt for any that are missing."""
+        changed = False
+        for cat in CATEGORY_MAP.keys():
+            if not self.has_asked(cat):
+                self.request(cat, auto_save=False)
+                changed = True
+        if changed:
+            self.save()
+
+approvals = ApprovalManager()
+
 def find_browser_history(browser: str) -> list[Path]:
     """Finds all browser history paths across all profiles."""
     if browser not in PLATFORM_PATHS: return []
@@ -286,6 +382,16 @@ def tool_claude_history(limit: int = 20, query: str = "") -> str:
     
     return "\n".join(out)
 
+def tool_request_approvals() -> str:
+    """Manually trigger approval requests for any unapproved categories."""
+    count_before = len(TOOLS)
+    for cat in CATEGORY_MAP.keys():
+        if not approvals.is_approved(cat):
+            approvals.request(cat)
+    # Re-run discovery to pick up newly approved apps
+    tool_discover_apps()
+    count_after = len(TOOLS)
+    return f"Approval flow complete. {count_after - count_before} new tools registered."
 
 def count_db_rows(db_path: Path) -> int:
     """Count total rows across all tables in a SQLite db using a temp copy."""
@@ -402,6 +508,16 @@ def tool_discover_apps(at_startup: bool = False) -> str:
         if peak <= 10 and table_count < 5:
             low_density += 1
             continue
+
+        # Check category approval
+        category = classify_app(name_key)
+        if approvals.is_denied(category):
+            skipped_consent += 1
+            continue
+        if not approvals.has_asked(category):
+            if approvals.request(category) == "denied":
+                skipped_consent += 1
+                continue
 
         # Register app
         DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "peak_rows": peak}
@@ -621,6 +737,7 @@ TOOLS = [
     {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
     {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
     {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
+    {"name": "ldp_request_approvals", "description": "Re-prompt for access to any denied app categories.", "inputSchema": {"type":"object"}},
 ]
 
 TOOL_MAP = {
@@ -633,10 +750,14 @@ TOOL_MAP = {
     "ldp_chrome_history": lambda a: tool_chrome_history(),
     "ldp_shell_history": lambda a: tool_shell_history(),
     "ldp_claude_history": lambda a: tool_claude_history(a.get("limit", 20), a.get("query", "")),
+    "ldp_request_approvals": lambda a: tool_request_approvals(),
 }
 
 def main():
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")
+    
+    # Run generic category approvals at startup if never asked
+    approvals.run_first_run_approvals()
     
     # Run discovery at startup to populate TOOLS
     tool_discover_apps(at_startup=True)
