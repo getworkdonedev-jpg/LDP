@@ -611,7 +611,7 @@ export class AutoConnectorGenerator {
         const canAutoRegister = maxRows > 10 || isWhitelisted;
 
         if (isLowPriority && !isWhitelisted) {
-          console.log(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
+          console.warn(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
           continue; 
         }
 

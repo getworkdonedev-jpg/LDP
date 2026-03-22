@@ -211,7 +211,8 @@ def tool_discover_apps(at_startup: bool = False) -> str:
             ["npx", "tsx", str(script), "--json"],
             capture_output=True, text=True, timeout=60, cwd=str(CORE_SCRIPTS)
         )
-        if result.returncode != 0: return f"Discovery failed: {result.stderr}"
+        if result.returncode != 0:
+            return f"Discovery failed: {result.stderr}"
         
         # Parse JSON output
         try:
@@ -219,7 +220,8 @@ def tool_discover_apps(at_startup: bool = False) -> str:
         except json.JSONDecodeError:
             return f"Discovery failed: Invalid JSON output from scanner."
 
-        if not apps: return "No new apps found."
+        if not apps:
+            return "No new apps found."
         
         count = 0
         for a in apps:
@@ -259,7 +261,6 @@ def tool_discover_apps(at_startup: bool = False) -> str:
                 count = count + 1
         
         if at_startup:
-            sys.stderr.write(f"[LDP] Auto-discovered {count} apps at startup.\n")
             return f"Synchronized {count} apps."
         return f"Discovered {count} new apps and registered them as tools."
     except Exception as e:
