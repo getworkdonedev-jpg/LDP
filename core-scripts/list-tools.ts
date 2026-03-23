@@ -23,6 +23,7 @@ async function main() {
     "signal":     "signal",
     "telegram":   "telegram",
     "vscode":     "vscode_workspaces",
+    "vs_code":    "vscode_workspaces",
     "health":     "system_health",
   };
 
