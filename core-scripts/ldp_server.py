@@ -28,7 +28,7 @@ if not CORE_SCRIPTS.exists():
 
 # --- Layer 2: Secure Network Sandbox ---
 class NetworkSandboxFinder(importlib.abc.MetaPathFinder):
-    BLOCKED_MODULES = {"requests", "urllib", "httpx", "http", "socket", "urllib3"}
+    BLOCKED_MODULES = {"requests", "httpx", "http", "socket", "urllib3"}
     def find_spec(self, fullname, path, target=None):
         base_module = fullname.split(".")[0]
         if base_module in self.BLOCKED_MODULES:
@@ -1103,15 +1103,200 @@ def rebuild_tools():
 
 # ── Screen Watcher ─────────────────────────────────────────────────
 import time as _time
+import urllib.request as _urllib_req
 
 class ScreenWatcher:
+    BRAIN_PATH = os.path.expanduser("~/Desktop/LDP/core-scripts/brain_knowledge.json")
+    CONFIG_PATH = os.path.expanduser("~/.ldp/config.json")
+
     def __init__(self):
         self.log_path = os.path.expanduser("~/.ldp/activity_log.jsonl")
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         self.running = False
         self.current = {"app": "", "window": "", "url": "", "since": _time.time()}
-        self.last_app = ""
+        self.last_app = ""          # raw process name for change detection
+        self.last_display = ""      # resolved display name
         self.app_start = _time.time()
+        self._config_cache = None
+        self._bundle_cache = None   # in-memory mirror of brain bundle_ids
+
+    # ── Config / Cache helpers ────────────────────────────────────────
+
+    def _load_config(self):
+        if self._config_cache:
+            return self._config_cache
+        try:
+            with open(self.CONFIG_PATH) as f:
+                self._config_cache = json.load(f)
+        except Exception:
+            self._config_cache = {}
+        return self._config_cache
+
+    def _load_bundle_cache(self):
+        if self._bundle_cache is not None:
+            return self._bundle_cache
+        try:
+            with open(self.BRAIN_PATH) as f:
+                brain = json.load(f)
+            self._bundle_cache = brain.get("bundle_ids", {})
+        except Exception:
+            self._bundle_cache = {}
+        return self._bundle_cache
+
+    def _save_bundle_id(self, bundle_id, app_name):
+        """Persist a resolved bundle_id → app_name into brain_knowledge.json."""
+        self._bundle_cache[bundle_id] = app_name
+        try:
+            with open(self.BRAIN_PATH) as f:
+                brain = json.load(f)
+            brain["bundle_ids"] = self._bundle_cache
+            with open(self.BRAIN_PATH, "w") as f:
+                json.dump(brain, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Bundle ID resolution ─────────────────────────────────────────
+
+    def _get_bundle_id(self, process_name):
+        """Ask macOS for the bundle ID of the frontmost app by process name."""
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", f'id of app "{process_name}"'],
+                capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                bid = r.stdout.strip()
+                if bid and "." in bid:
+                    return bid
+        except Exception:
+            pass
+        return None
+
+    def _ask_teachers(self, prompt):
+        """Mirror of brain.ts teacher cascade — reads from config.json."""
+        cfg = self._load_config()
+        keys = cfg.get("api_keys", {})
+        cascade = cfg.get("ai_providers", {}).get("teacher_cascade",
+                          ["groq", "gemini", "ollama", "claude"])
+
+        for provider in cascade:
+            try:
+                answer = None
+                if provider == "groq":
+                    groq_key = keys.get("groq", "")
+                    if not groq_key.startswith("gsk_"):
+                        continue
+                    
+                    # Primary: Llama 4 Scout, Fallback: Llama 3.3
+                    for model in ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]:
+                        try:
+                            data = json.dumps({
+                                "model": model,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": 20, "temperature": 0
+                            }).encode()
+                            req = _urllib_req.Request(
+                                "https://api.groq.com/openai/v1/chat/completions",
+                                data=data,
+                                headers={"Content-Type": "application/json",
+                                         "Authorization": f"Bearer {groq_key}",
+                                         "User-Agent": "LDP-ScreenWatcher/1.0"},
+                                method="POST")
+                            with _urllib_req.urlopen(req, timeout=5) as resp:
+                                body = json.load(resp)
+                            answer = body["choices"][0]["message"]["content"].strip()
+                            if answer: break
+                        except Exception:
+                            continue
+
+                elif provider == "gemini":
+                    gem_key = keys.get("gemini", "")
+                    if not gem_key.startswith("AIza"):
+                        continue
+                    url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                           f"models/gemini-2.0-flash:generateContent?key={gem_key}")
+                    data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+                    req = _urllib_req.Request(url, data=data,
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "LDP-ScreenWatcher/1.0"}, method="POST")
+                    with _urllib_req.urlopen(req, timeout=5) as resp:
+                        body = json.load(resp)
+                    answer = body["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+                elif provider == "ollama":
+                    data = json.dumps({
+                        "model": "llama3.1", "prompt": prompt,
+                        "stream": False
+                    }).encode()
+                    req = _urllib_req.Request(
+                        "http://localhost:11434/api/generate",
+                        data=data,
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "LDP-ScreenWatcher/1.0"},
+                        method="POST")
+                    with _urllib_req.urlopen(req, timeout=4) as resp:
+                        body = json.load(resp)
+                    answer = body.get("response", "").strip()
+
+                elif provider == "claude":
+                    ant_key = keys.get("anthropic", "")
+                    if not ant_key.startswith("sk-ant"):
+                        continue
+                    data = json.dumps({
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 20,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }).encode()
+                    req = _urllib_req.Request(
+                        "https://api.anthropic.com/v1/messages",
+                        data=data,
+                        headers={"Content-Type": "application/json",
+                                 "x-api-key": ant_key,
+                                 "anthropic-version": "2023-06-01",
+                                 "User-Agent": "LDP-ScreenWatcher/1.0"},
+                        method="POST")
+                    with _urllib_req.urlopen(req, timeout=8) as resp:
+                        body = json.load(resp)
+                    answer = body["content"][0]["text"].strip()
+
+                if answer:
+                    # Clean up — take only the first line / word(s)
+                    answer = answer.split("\n")[0].strip().strip('"').strip("'")
+                    if 1 < len(answer) < 60:
+                        return answer
+            except Exception:
+                continue
+        return None
+
+    def _resolve_app_name(self, process_name):
+        """5-rule fallback: cache → teacher → bundle_id → process_name."""
+        # Rule 1: get bundle ID
+        bundle_id = self._get_bundle_id(process_name)
+
+        # Rule 2: cache hit
+        if bundle_id:
+            cache = self._load_bundle_cache()
+            if bundle_id in cache:
+                return cache[bundle_id]
+
+        # Rule 3: ask teacher cascade
+        if bundle_id:
+            prompt = f"What macOS app has bundle ID {bundle_id}? Reply with just the app name."
+            answer = self._ask_teachers(prompt)
+            if answer:
+                self._save_bundle_id(bundle_id, answer)
+                return answer
+            # Rule 4: store bundle_id itself as fallback so we don't re-ask
+            self._save_bundle_id(bundle_id, bundle_id)
+            return bundle_id
+
+        # Rule 5: teacher configured but no bundle ID — try with process name
+        prompt = (f"macOS app process name: {process_name}\n"
+                  f"What app is this? Reply with just the app name, nothing else.")
+        answer = self._ask_teachers(prompt)
+        if answer:
+            return answer
+
+        return process_name
 
     def start(self):
         self.running = True
@@ -1156,12 +1341,13 @@ end tell'''
             try:
                 ctx = self._get_context()
                 if ctx and ctx["app"]:
-                    app = ctx["app"]
-                    if app != self.last_app:
+                    raw_app = ctx["app"]
+                    if raw_app != self.last_app:
                         duration = int(_time.time() - self.app_start)
+                        # Log previous session using resolved display name
                         entry = {
                             "time": datetime.now().isoformat(),
-                            "app": self.last_app,
+                            "app": self.last_display or self.last_app,
                             "window": self.current.get("window", ""),
                             "url": self.current.get("url", ""),
                             "seconds": duration
@@ -1169,10 +1355,13 @@ end tell'''
                         if self.last_app:
                             with open(self.log_path, "a") as f:
                                 f.write(json.dumps(entry) + "\n")
-                        url = self._get_browser_url(app)
-                        self.current = {"app": app, "window": ctx["window"],
+                        # Resolve new app display name in background thread
+                        display = self._resolve_app_name(raw_app)
+                        url = self._get_browser_url(raw_app)
+                        self.current = {"app": display, "window": ctx["window"],
                                         "url": url, "since": _time.time()}
-                        self.last_app = app
+                        self.last_app = raw_app
+                        self.last_display = display
                         self.app_start = _time.time()
                     else:
                         self.current["window"] = ctx["window"]

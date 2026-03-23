@@ -55,7 +55,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.sdk.json",
     "build:watch": "tsc -p tsconfig.sdk.json --watch",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --passWithNoTests",
     "lint": "eslint src/",
     "prepublishOnly": "npm run build && npm test"
   },

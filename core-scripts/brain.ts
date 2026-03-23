@@ -528,7 +528,10 @@ async function askAI(
     if (provider === "gemini") {
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "User-Agent": "LDP-ScreenWatcher/1.0"
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { responseMimeType: "application/json", maxOutputTokens: 300 }
@@ -540,7 +543,8 @@ async function askAI(
         headers: {
           "Content-Type": "application/json",
           "x-api-key": apiKey!,
-          "anthropic-version": "2023-06-01"
+          "anthropic-version": "2023-06-01",
+          "User-Agent": "LDP-ScreenWatcher/1.0"
         },
         body: JSON.stringify({
           model: model || "claude-3-5-sonnet-20240620",
@@ -553,7 +557,8 @@ async function askAI(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
+          "Authorization": `Bearer ${apiKey}`,
+          "User-Agent": "LDP-ScreenWatcher/1.0"
         },
         body: JSON.stringify({
           model,
@@ -611,8 +616,12 @@ export async function identifyWithTeachers(schemaContext: any, counts: any, file
   // Level 1: Groq
   if (await detectProvider("groq")) {
     try {
-      console.log("[TEACHER] Asking Groq...");
-      const result = await askAI("groq", schema, process.env.GROQ_API_KEY, "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile");
+      console.log("[TEACHER] Asking Groq (Llama 4 Scout)...");
+      let result = await askAI("groq", schema, process.env.GROQ_API_KEY, "https://api.groq.com/openai/v1", "meta-llama/llama-4-scout-17b-16e-instruct");
+      if (!result) {
+        console.log("[TEACHER] Groq Llama 4 failed, falling back to Llama 3.3...");
+        result = await askAI("groq", schema, process.env.GROQ_API_KEY, "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile");
+      }
       if (result && result.confidence > 0.7) return { ...result, source: "groq" };
     } catch (e) { console.log("[TEACHER] Groq failed", e); }
   }
