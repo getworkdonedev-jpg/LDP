@@ -1138,18 +1138,18 @@ class ScreenWatcher:
         try:
             with open(self.BRAIN_PATH) as f:
                 brain = json.load(f)
-            self._bundle_cache = brain.get("bundle_ids", {})
+            self._bundle_cache = brain.get("path_map", {})
         except Exception:
             self._bundle_cache = {}
         return self._bundle_cache
 
-    def _save_bundle_id(self, bundle_id, app_name):
-        """Persist a resolved bundle_id → app_name into brain_knowledge.json."""
-        self._bundle_cache[bundle_id] = app_name
+    def _save_path_mapping(self, path, app_name):
+        """Persist a resolved path → app_name into brain_knowledge.json."""
+        self._bundle_cache[path] = app_name
         try:
             with open(self.BRAIN_PATH) as f:
                 brain = json.load(f)
-            brain["bundle_ids"] = self._bundle_cache
+            brain["path_map"] = self._bundle_cache
             with open(self.BRAIN_PATH, "w") as f:
                 json.dump(brain, f, indent=2)
         except Exception:
@@ -1157,149 +1157,27 @@ class ScreenWatcher:
 
     # ── Bundle ID resolution ─────────────────────────────────────────
 
-    def _get_bundle_id(self, process_name):
-        """Ask macOS for the bundle ID of the frontmost app by process name."""
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", f'id of app "{process_name}"'],
-                capture_output=True, text=True, timeout=2)
-            if r.returncode == 0:
-                bid = r.stdout.strip()
-                if bid and "." in bid:
-                    return bid
-        except Exception:
-            pass
-        return None
-
-    def _ask_teachers(self, prompt):
-        """Mirror of brain.ts teacher cascade — reads from config.json."""
-        cfg = self._load_config()
-        keys = cfg.get("api_keys", {})
-        cascade = cfg.get("ai_providers", {}).get("teacher_cascade",
-                          ["groq", "gemini", "ollama", "claude"])
-
-        for provider in cascade:
+    def _resolve_app_name(self, process_name, exe_path):
+        """Identifies app name from executable path (preferred) or process name."""
+        # Rule 1: Extract from /Applications path
+        if exe_path and "/Applications/" in exe_path:
             try:
-                answer = None
-                if provider == "groq":
-                    groq_key = keys.get("groq", "")
-                    if not groq_key.startswith("gsk_"):
-                        continue
-                    
-                    # Primary: Llama 4 Scout, Fallback: Llama 3.3
-                    for model in ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]:
-                        try:
-                            data = json.dumps({
-                                "model": model,
-                                "messages": [{"role": "user", "content": prompt}],
-                                "max_tokens": 20, "temperature": 0
-                            }).encode()
-                            req = _urllib_req.Request(
-                                "https://api.groq.com/openai/v1/chat/completions",
-                                data=data,
-                                headers={"Content-Type": "application/json",
-                                         "Authorization": f"Bearer {groq_key}",
-                                         "User-Agent": "LDP-ScreenWatcher/1.0"},
-                                method="POST")
-                            with _urllib_req.urlopen(req, timeout=5) as resp:
-                                body = json.load(resp)
-                            answer = body["choices"][0]["message"]["content"].strip()
-                            if answer: break
-                        except Exception:
-                            continue
-
-                elif provider == "gemini":
-                    gem_key = keys.get("gemini", "")
-                    if not gem_key.startswith("AIza"):
-                        continue
-                    url = (f"https://generativelanguage.googleapis.com/v1beta/"
-                           f"models/gemini-2.0-flash:generateContent?key={gem_key}")
-                    data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
-                    req = _urllib_req.Request(url, data=data,
-                        headers={"Content-Type": "application/json",
-                                 "User-Agent": "LDP-ScreenWatcher/1.0"}, method="POST")
-                    with _urllib_req.urlopen(req, timeout=5) as resp:
-                        body = json.load(resp)
-                    answer = body["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-                elif provider == "ollama":
-                    data = json.dumps({
-                        "model": "llama3.1", "prompt": prompt,
-                        "stream": False
-                    }).encode()
-                    req = _urllib_req.Request(
-                        "http://localhost:11434/api/generate",
-                        data=data,
-                        headers={"Content-Type": "application/json",
-                                 "User-Agent": "LDP-ScreenWatcher/1.0"},
-                        method="POST")
-                    with _urllib_req.urlopen(req, timeout=4) as resp:
-                        body = json.load(resp)
-                    answer = body.get("response", "").strip()
-
-                elif provider == "claude":
-                    ant_key = keys.get("anthropic", "")
-                    if not ant_key.startswith("sk-ant"):
-                        continue
-                    data = json.dumps({
-                        "model": "claude-sonnet-4-20250514",
-                        "max_tokens": 20,
-                        "messages": [{"role": "user", "content": prompt}]
-                    }).encode()
-                    req = _urllib_req.Request(
-                        "https://api.anthropic.com/v1/messages",
-                        data=data,
-                        headers={"Content-Type": "application/json",
-                                 "x-api-key": ant_key,
-                                 "anthropic-version": "2023-06-01",
-                                 "User-Agent": "LDP-ScreenWatcher/1.0"},
-                        method="POST")
-                    with _urllib_req.urlopen(req, timeout=8) as resp:
-                        body = json.load(resp)
-                    answer = body["content"][0]["text"].strip()
-
-                if answer:
-                    # Clean up — take only the first line / word(s)
-                    answer = answer.split("\n")[0].strip().strip('"').strip("'")
-                    if 1 < len(answer) < 60:
-                        return answer
+                # /Applications/Cursor.app/Contents/MacOS/Cursor -> Cursor
+                app_name = exe_path.split("/Applications/")[1].split(".app")[0]
+                if "/" in app_name: # Handle nested Applications folders
+                    app_name = app_name.split("/")[-1]
+                if app_name:
+                    return app_name
             except Exception:
-                continue
-        return None
+                pass
 
-    def _resolve_app_name(self, process_name):
-        """5-rule fallback: cache → teacher → bundle_id → process_name."""
-        # Rule 1: get bundle ID
-        bundle_id = self._get_bundle_id(process_name)
+        # Rule 2: Path-based cache hit
+        if exe_path:
+            cache = self._load_path_cache()
+            if exe_path in cache:
+                return cache[exe_path]
 
-        # Rule 2: cache hit
-        if bundle_id:
-            cache = self._load_bundle_cache()
-            if bundle_id in cache:
-                return cache[bundle_id]
-
-        # Rule 3: ask teacher cascade
-        if bundle_id:
-            prompt = (f"I am running a macOS app with bundle identifier '{bundle_id}'. "
-                      f"What is the exact marketing name of this application? "
-                      f"Consider that com.github.Electron is used by Cursor (not VS Code). "
-                      f"VS Code uses com.microsoft.VSCode. Reply with ONLY the app name, "
-                      f"nothing else. No explanation.")
-            answer = self._ask_teachers(prompt)
-            if answer:
-                self._save_bundle_id(bundle_id, answer)
-                return answer
-            # Rule 4: store bundle_id itself as fallback so we don't re-ask
-            self._save_bundle_id(bundle_id, bundle_id)
-            return bundle_id
-
-        # Rule 5: teacher configured but no bundle ID — try with process name
-        prompt = (f"macOS app process name: {process_name}\n"
-                  f"What app is this? Reply with just the app name, nothing else.")
-        answer = self._ask_teachers(prompt)
-        if answer:
-            return answer
-
+        # Rule 3: Use process name as fallback
         return process_name
 
     def start(self):
@@ -1308,12 +1186,16 @@ class ScreenWatcher:
 
     def _get_context(self):
         script = '''tell application "System Events"
-    set frontApp to name of first application process whose frontmost is true
+    set frontProc to first application process whose frontmost is true
+    set exePath to ""
+    try
+        set exePath to POSIX path of (file of frontProc as alias)
+    end try
     set winTitle to ""
     try
-        set winTitle to name of front window of process frontApp
+        set winTitle to name of front window of frontProc
     end try
-    return frontApp & "|||" & winTitle
+    return (name of frontProc) & "|||" & winTitle & "|||" & exePath
 end tell'''
         try:
             r = subprocess.run(["osascript", "-e", script],
@@ -1321,7 +1203,8 @@ end tell'''
             if r.returncode == 0:
                 parts = r.stdout.strip().split("|||")
                 return {"app": parts[0].strip() if parts else "",
-                        "window": parts[1].strip() if len(parts) > 1 else ""}
+                        "window": parts[1].strip() if len(parts) > 1 else "",
+                        "path": parts[2].strip() if len(parts) > 2 else ""}
         except Exception:
             pass
         return None
@@ -1359,8 +1242,8 @@ end tell'''
                         if self.last_app:
                             with open(self.log_path, "a") as f:
                                 f.write(json.dumps(entry) + "\n")
-                        # Resolve new app display name in background thread
-                        display = self._resolve_app_name(raw_app)
+                        # Resolve new app display name from path
+                        display = self._resolve_app_name(raw_app, ctx.get("path", ""))
                         url = self._get_browser_url(raw_app)
                         self.current = {"app": display, "window": ctx["window"],
                                         "url": url, "since": _time.time()}
