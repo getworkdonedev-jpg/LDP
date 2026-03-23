@@ -44,7 +44,7 @@ import { execSync }      from "node:child_process";
 import { createRequire } from "node:module";
 import type { LDPEngine }                from "./engine.js";
 import type { BaseConnector, Row, SchemaMap } from "./types.js";
-import { getLearnedBase }               from "./learned.js";
+import { KnowledgeBase }               from "./brain.js";
 import type { DataCategory, DecryptMethod } from "./brain.js";
 
 const require = createRequire(import.meta.url);
@@ -64,6 +64,7 @@ export interface ScannedFile {
   encrypted:  boolean;
   totalRows:  number;
   maxRows:    number;
+  staticMatch?: "mail" | "shell" | "git" | "logs" | "plist";
 }
 
 export interface ProcessInfo {
@@ -102,7 +103,7 @@ export interface ScanResult {
 
 export interface SystemScannerOptions {
   verbose?:              boolean;
-  maxFiles?:             number;    // default 2000
+  maxFiles?:             number;    // default 5000
   maxDepth?:             number;    // default 8
   autoConnectThreshold?: number;    // default 0.80
   engine?:               InstanceType<typeof import("./engine.js").LDPEngine>;
@@ -125,42 +126,37 @@ const SKIP_DIRS = new Set([
 ]);
 
 const SKIP_PATH_PATTERNS = [
-  "/System/","/usr/","/private/var/","/Library/Caches/","/Library/Logs/",
+  "/System/","/usr/","/private/var/","/Library/Caches/",
   "/.Spotlight-","/CoreData/","metadata.sqlite","CloudKitLocalStore",
   "com.apple.bird","CoreDataUbiquitySupport",
   "StoreKit.db", "DriveFS/root_preference_sqlite.db",
+  "tomb","backup","cache","thumbnail","authorization",
+  "akd","siri_inference","heavy_ad","tipkit","dock_desktop"
 ];
 
-const DATA_EXTS = new Set([".db",".sqlite",".sqlite3",".db3",".vscdb",".json",".csv"]);
+const DATA_EXTS = new Set([
+  ".db", ".sqlite", ".sqlite3", ".db3", ".vscdb", ".json", ".csv",
+  ".emlx", ".zsh_history", ".bash_history", ".plist"
+]);
 
 // ── Scan roots ────────────────────────────────────────────────────────────────
 function getScanRoots(): string[] {
   const h = os.homedir();
-  if (process.platform === "darwin") return [
-    h,
-    path.join(h,"Library","Application Support"),
-    path.join(h,"Library","Containers"),
-    path.join(h,"Library","Group Containers"),
-    path.join(h,"Library","Messages"),
-    path.join(h,"Library","Mail"),
-    path.join(h,"Documents"),
-    path.join(h,"Downloads"),
-    path.join(h,"Desktop"),
+  const roots = [
+    path.join(h, "Library", "Messages"),
+    path.join(h, "Library", "Safari"),
+    path.join(h, "Library", "Mail"),
+    path.join(h, "Library", "Notes"),
+    path.join(h, "Library", "Calendars"),
+    path.join(h, "Library", "Reminders"),
+    path.join(h, "Library", "Group Containers"),
+    path.join(h, "Library", "Application Support"),
+    path.join(h, "Music"),
+    path.join(h, "Documents"),
+    path.join(h, "Desktop"),
+    "/var/log"
   ];
-  if (process.platform === "linux") return [
-    h,
-    path.join(h,".config"),
-    path.join(h,".local","share"),
-    path.join(h,"Documents"),
-    path.join(h,"Downloads"),
-  ];
-  return [
-    h,
-    process.env.APPDATA ?? path.join(h,"AppData","Roaming"),
-    process.env.LOCALAPPDATA ?? path.join(h,"AppData","Local"),
-    path.join(h,"Documents"),
-    path.join(h,"Downloads"),
-  ];
+  return roots.filter(r => fs.existsSync(r));
 }
 
 function shouldSkip(name: string, full: string): boolean {
@@ -185,10 +181,24 @@ function walk(
     for (const e of entries) {
       if (files >= max) break;
       const fp = path.join(dir, e.name);
-      if (e.isDirectory()) { if (!shouldSkip(e.name, fp)) recurse(fp, depth+1); continue; }
+      if (e.isDirectory()) {
+        if (e.name === ".git") {
+          cb(fp, fs.statSync(fp));
+          continue;
+        }
+        if (!shouldSkip(e.name, fp)) recurse(fp, depth+1);
+        continue;
+      }
       if (e.isFile()) {
         if (shouldSkip(e.name, fp)) continue;
-        if (!DATA_EXTS.has(path.extname(e.name).toLowerCase())) continue;
+        const ext = path.extname(e.name).toLowerCase();
+        if (ext === ".log") {
+          if (fp.startsWith("/var/log") || fp.includes("/Library/Logs/")) {
+             cb(fp, fs.statSync(fp));
+          }
+          continue;
+        }
+        if (!DATA_EXTS.has(ext)) continue;
         let stat: fs.Stats;
         try { stat = fs.statSync(fp); } catch { continue; }
         if (stat.size < 512 || stat.size > 500*1024*1024) continue;
@@ -214,6 +224,9 @@ function fingerprint(fp: string): FileType {
     fs.closeSync(fd);
     if (n < 6) return "unknown";
     if (buf.toString("utf8", 0, 6) === "SQLite") return "sqlite";
+    if (ext === ".emlx" || path.basename(fp).includes("zsh_history") || path.basename(fp).includes("bash_history") || ext === ".plist" || ext === ".log" || path.basename(fp) === ".git") {
+      return "json"; // loosely treat static matches as generic data files for processor
+    }
     const nonzero = buf.reduce((s,b) => s+(b>0?1:0), 0);
     if (nonzero > 8) return "sqlcipher";
     return "unknown";
@@ -222,36 +235,25 @@ function fingerprint(fp: string): FileType {
 
 // ── Phase 3: Identify ─────────────────────────────────────────────────────────
 const PATH_SIGS: Array<{ pat: RegExp; app: string; cat: DataCategory; conf: number }> = [
+  { pat: /Messages.*chat\.db/i,                                  app:"iMessage",        cat:"messaging",  conf:0.99 },
+  { pat: /group\.com\.apple\.notes.*NoteStore\.sqlite/i,         app:"Apple Notes",     cat:"notes",      conf:0.99 },
+  { pat: /Safari.*History\.db/i,                                 app:"Safari",          cat:"browser",    conf:0.99 },
+  { pat: /Calendars.*\.sqlite/i,                                 app:"Calendar",        cat:"calendar",   conf:0.98 },
+  { pat: /Reminders.*\.sqlite/i,                                 app:"Reminders",       cat:"calendar",   conf:0.98 },
+  { pat: /AddressBook.*\.sqlitedb/i,                             app:"Contacts",        cat:"contacts",   conf:0.98 },
+  { pat: /Music.*\.sqlite/i,                                     app:"Apple Music",     cat:"media",      conf:0.98 },
+  { pat: /group\.com\.apple\.journal.*\.sqlite/i,                app:"Apple Journal",   cat:"notes",      conf:0.98 },
   { pat: /Chrome.*History|Brave.*History|Chromium.*History/i,   app:"Chrome/Brave",    cat:"browser",    conf:0.97 },
   { pat: /Firefox.*places\.sqlite/i,                            app:"Firefox",         cat:"browser",    conf:0.97 },
   { pat: /Signal.*db\.sqlite/i,                                  app:"Signal",          cat:"messaging",  conf:0.97 },
-  { pat: /Messages.*chat\.db/i,                                  app:"iMessage",        cat:"messaging",  conf:0.97 },
   { pat: /WhatsApp.*ChatStorage/i,                               app:"WhatsApp",        cat:"messaging",  conf:0.97 },
   { pat: /Telegram.*db_sqlite/i,                                 app:"Telegram",        cat:"messaging",  conf:0.95 },
   { pat: /Code.*globalStorage.*vscdb|Cursor.*globalStorage/i,   app:"VS Code/Cursor",  cat:"developer",  conf:0.97 },
   { pat: /Spotify.*podcasts\.db/i,                               app:"Spotify",         cat:"media",      conf:0.95 },
-  { pat: /NoteStore\.sqlite/i,                                   app:"Apple Notes",     cat:"notes",      conf:0.97 },
   { pat: /healthdb_secure\.sqlite|HealthKit/i,                   app:"Apple Health",    cat:"health",     conf:0.95 },
-  { pat: /AddressBook\.sqlitedb|contacts\.db/i,                  app:"Contacts",        cat:"contacts",   conf:0.90 },
-  { pat: /Calendar.*Calendar\.sqlitedb/i,                        app:"Calendar",        cat:"calendar",   conf:0.90 },
-  { pat: /Reminders\.storedata/i,                                app:"Reminders",       cat:"calendar",   conf:0.90 },
-  { pat: /Mail.*Envelope Index/i,                                app:"Apple Mail",      cat:"other",      conf:0.90 },
   { pat: /Slack.*db$/i,                                          app:"Slack",           cat:"messaging",  conf:0.88 },
   { pat: /Discord.*db$/i,                                        app:"Discord",         cat:"messaging",  conf:0.88 },
   { pat: /Obsidian.*\.sqlite/i,                                  app:"Obsidian",        cat:"notes",      conf:0.88 },
-  { pat: /zoom.*db$/i,                                           app:"Zoom",            cat:"other",      conf:0.82 },
-];
-
-const SCHEMA_SIGS: Array<{ cols: string[]; app: string; cat: DataCategory; conf: number }> = [
-  { cols:["url","visit_count","last_visit_time"],     app:"Browser History",  cat:"browser",   conf:0.85 },
-  { cols:["body","sent_at","conversationId"],         app:"Messaging App",    cat:"messaging", conf:0.80 },
-  { cols:["text","date","is_from_me","handle_id"],    app:"iMessage",         cat:"messaging", conf:0.90 },
-  { cols:["title","content","created_at"],            app:"Notes App",        cat:"notes",     conf:0.75 },
-  { cols:["amount","merchant","transaction_date"],    app:"Finance App",      cat:"finance",   conf:0.80 },
-  { cols:["track_id","artist","play_count"],          app:"Music Player",     cat:"media",     conf:0.80 },
-  { cols:["event_id","dtstart","summary"],            app:"Calendar App",     cat:"calendar",  conf:0.80 },
-  { cols:["steps","heart_rate","start_date"],         app:"Health App",       cat:"health",    conf:0.82 },
-  { cols:["name","email","phone"],                    app:"Contacts App",     cat:"contacts",  conf:0.75 },
 ];
 
 function identifyFromPath(fp: string) {
@@ -313,35 +315,113 @@ function readColumns(fp: string, tables: string[]): string[] {
   return cols;
 }
 
-function identifyFromSchema(tables: string[], columns: string[]) {
-  const all = [...tables,...columns].map(s => s.toLowerCase());
-  for (const s of SCHEMA_SIGS) {
-    const hits = s.cols.filter(c => all.includes(c)).length;
-    if (hits >= Math.ceil(s.cols.length * 0.6)) {
-      return { app: s.app, cat: s.cat, conf: s.conf * (hits / s.cols.length) };
-    }
-  }
-  return null;
-}
+// Brain fingerprinting handler dynamically passed tables now
+// (Implemented across phase boundaries)
 
-async function analyseFile(fp: string, stat: fs.Stats, ft: FileType): Promise<ScannedFile> {
+async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any): Promise<ScannedFile> {
   const base: ScannedFile = {
     filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
     appName: path.basename(fp), category: "other", confidence: 0.1,
     tables: [], encrypted: ft === "sqlcipher", totalRows: 0, maxRows: 0,
   };
 
+  if (fp.endsWith(".emlx")) {
+    const res = { ...base, appName:"Apple Mail", category:"messaging", confidence:1.0, staticMatch:"mail" } as ScannedFile;
+    const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ appKey: `static_mail_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "messaging", params: {}, schema: {}, confidence: 1.0 }, false);
+    return res;
+  }
+  if (path.basename(fp).includes("zsh_history") || path.basename(fp).includes("bash_history")) {
+    const res = { ...base, appName:"Terminal Shell", category:"developer", confidence:1.0, staticMatch:"shell" } as ScannedFile;
+    const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ appKey: `static_shell_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "developer", params: {}, schema: {}, confidence: 1.0 }, false);
+    return res;
+  }
+  if (fp.endsWith(".git")) {
+    const res = { ...base, appName:"Git Repository", category:"developer", confidence:1.0, staticMatch:"git" } as ScannedFile;
+    const slug = path.basename(path.dirname(fp)).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ appKey: `static_git_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "developer", params: {}, schema: {}, confidence: 1.0 }, false);
+    return res;
+  }
+  if (fp.endsWith(".log")) {
+    const res = { ...base, appName:"System Logs", category:"other", confidence:1.0, staticMatch:"logs" } as ScannedFile;
+    const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ appKey: `static_logs_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "other", params: {}, schema: {}, confidence: 1.0 }, false);
+    return res;
+  }
+  if (fp.endsWith(".plist")) {
+    const res = { ...base, appName:"App Preferences", category:"other", confidence:1.0, staticMatch:"plist" } as ScannedFile;
+    const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ appKey: `static_plist_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "other", params: {}, schema: {}, confidence: 1.0 }, false);
+    return res;
+  }
+
   const pm = identifyFromPath(fp);
   const tables = (ft === "sqlite" || ft === "sqlcipher") ? readTables(fp) : [];
   const density = ft === "sqlite" ? readDensity(fp, tables) : { total: 0, max: 0 };
 
-  if (pm) return { ...base, appName: pm.app, category: pm.cat, confidence: pm.conf, tables, totalRows: density.total, maxRows: density.max };
+  if (pm) {
+    const res = { ...base, appName: pm.app, category: pm.cat, confidence: pm.conf, tables, totalRows: density.total, maxRows: density.max };
+    const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    kb.learn({ 
+      appKey: `path_${pm.app.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`, 
+      appName: pm.app, 
+      filePath: fp, 
+      method: ft === "sqlcipher" ? "unknown" : "plain_sqlite", 
+      category: pm.cat, 
+      params: {}, 
+      schema: {}, 
+      confidence: pm.conf,
+      totalRows: density.total,
+      maxRows: density.max
+    }, false);
+    return res;
+  }
 
-  if (ft === "sqlite") {
-    const columns = readColumns(fp, tables);
-    const sm = identifyFromSchema(tables, columns);
-    if (sm) return { ...base, tables, appName: sm.app, category: sm.cat, confidence: sm.conf, totalRows: density.total, maxRows: density.max };
-    return { ...base, tables, totalRows: density.total, maxRows: density.max, confidence: tables.length > 0 ? 0.3 : 0.1 };
+  if (ft === "sqlite" && density.max >= 10) {
+    // If table size >= 10, defer to Brain for identification
+    const { BrainFingerprint } = require("./brain.js");
+    const ai = BrainFingerprint(tables);
+    
+    if (ai.confidence >= 0.6) {
+      const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+      const appKey = `auto_${ai.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`;
+      if (!kb.lookup(fp)) {
+        kb.learn({
+          appKey,
+          appName: ai.appName,
+          filePath: fp,
+          method: "plain_sqlite",
+          category: ai.category,
+          params: {},
+          schema: {},
+          confidence: ai.confidence,
+          totalRows: density.total,
+          maxRows: density.max
+        }, false);
+      }
+      return { ...base, tables, appName: ai.appName, category: ai.category, confidence: ai.confidence, totalRows: density.total, maxRows: density.max };
+    } else {
+      const folder = path.basename(path.dirname(fp));
+      const unknownName = `unknown_${folder}`.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+      const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+      const appKey = `${unknownName}_${slug}`;
+      if (!kb.lookup(fp)) {
+        kb.learn({
+          appKey,
+          appName: unknownName,
+          filePath: fp,
+          method: "plain_sqlite",
+          category: "other",
+          params: {},
+          schema: {},
+          confidence: ai.confidence,
+          totalRows: density.total,
+          maxRows: density.max
+        }, false);
+      }
+      return { ...base, tables, appName: unknownName, category: "other", confidence: ai.confidence, totalRows: density.total, maxRows: density.max };
+    }
   }
 
   if (ft === "json" || ft === "csv") {
@@ -462,10 +542,10 @@ export class SystemScanner {
 
   async run(): Promise<ScanResult> {
     const t0        = Date.now();
-    const maxFiles  = this.opts.maxFiles ?? 2000;
+    const maxFiles  = this.opts.maxFiles ?? 5000;
     const maxDepth  = this.opts.maxDepth ?? 8;
     const threshold = this.opts.autoConnectThreshold ?? 0.80;
-    const learned   = getLearnedBase();
+    const learned   = new KnowledgeBase();
 
     if (this.opts.verbose) {
       console.log("\n[SCAN] Starting full system scan");
@@ -494,18 +574,18 @@ export class SystemScanner {
         const ft = fingerprint(fp);
         if (ft === "unknown") return null;
         // Check learned base first (instant)
-        const known = learned.lookup(fp);
+        const known = (learned as any).lookup(fp);
         if (known) {
           return {
             filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
             appName: known.appName, category: known.category,
             confidence: Math.min(known.confidence + 0.05, 1.0),
-            tables: Object.keys(known.schema), encrypted: known.method !== "plain_sqlite",
+            tables: Object.keys(known.schema || {}), encrypted: known.method !== "plain_sqlite",
             totalRows: (known as any).totalRows ?? 0,
             maxRows: (known as any).maxRows ?? 0,
           } as ScannedFile;
         }
-        return analyseFile(fp, stat, ft);
+        return (analyseFile as any)(fp, stat, ft, learned);
       }));
 
       for (const scanned of analysed) {
@@ -552,10 +632,17 @@ export class SystemScanner {
             const msg = await this.opts.engine.connect(name, false);
             if (msg.type === "ACK") {
               result.autoConnected.push(name);
+              const slug = path.basename(scanned.filePath).toLowerCase().replace(/[^a-z0-9]/g,"_");
+              const appKey = `auto_${scanned.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`;
               learned.learn({
-                filePath: scanned.filePath, appName: scanned.appName,
-                category: scanned.category, method: "plain_sqlite",
-                schema: {}, confidence: scanned.confidence,
+                appKey,
+                filePath: scanned.filePath, 
+                appName: scanned.appName,
+                category: scanned.category, 
+                method: "plain_sqlite",
+                params: {},
+                schema: {}, 
+                confidence: scanned.confidence,
                 totalRows: scanned.totalRows,
                 maxRows: scanned.maxRows,
               });
@@ -570,6 +657,33 @@ export class SystemScanner {
             result.skipped++;
           }
         }
+      }
+    }
+
+    // Rule 1: Direct Probing for High-Value Apps (Bypass TCC readdir blocks)
+    const h = os.homedir();
+    const probes = [
+      { path: path.join(h, "Library/Messages/chat.db"), app: "iMessage" },
+      { path: path.join(h, "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"), app: "Apple Notes" },
+      { path: path.join(h, "Library/Safari/History.db"), app: "Safari" },
+      { path: path.join(h, "Library/Calendars/Calendar.sqlitedb"), app: "Apple Calendar" },
+      { path: path.join(h, "Library/Application Support/AddressBook/AddressBook-v22.abcddb"), app: "Apple Contacts" },
+      { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlite"), app: "Reminders" },
+      { path: path.join(h, "Library/Group Containers/group.com.apple.journal/Journal.sqlite"), app: "Apple Journal" },
+      { path: path.join(h, "Music/Music/Music Library.musiclibrary/Library.sqlite"), app: "Apple Music" }
+    ];
+
+    for (const p of probes) {
+      if (fs.existsSync(p.path)) {
+        try {
+          const stat = fs.statSync(p.path);
+          const ft = fingerprint(p.path);
+          const scanned = await analyseFile(p.path, stat, ft, learned);
+          if (scanned.confidence >= threshold) {
+             result.databases.push(scanned);
+             result.autoConnected.push(scanned.appName.toLowerCase().replace(/[^a-z0-9]/g, "_"));
+          }
+        } catch {}
       }
     }
 
@@ -594,6 +708,9 @@ export class SystemScanner {
         console.log(`[SCAN] ${result.network.length} connections (${est} established)`);
       }
     }
+    
+    // Rule 6: Final commit of all learned knowledge
+    if (learned && (learned as any).save) (learned as any).save();
 
     result.durationMs = Date.now() - t0;
 

@@ -79,6 +79,53 @@ async function prompt(msg) {
         process.stdin.once("data", d => resolve(d.toString().trim()));
     });
 }
+async function dashboard() {
+    const fs = await import("fs");
+    const path = await import("path");
+    const { exec, spawn } = await import("child_process");
+    const ldpDir = path.join(process.env.HOME || process.env.USERPROFILE || "", ".ldp");
+    const portFile = path.join(ldpDir, "dashboard_port");
+    let port = 8765;
+    // Try to check if server is running by hitting /api/connectors
+    const http = await import("http");
+    const isRunning = await new Promise(resolve => {
+        let p = 8765;
+        if (fs.existsSync(portFile)) {
+            try {
+                p = parseInt(fs.readFileSync(portFile, "utf-8").trim(), 10) || 8765;
+            }
+            catch (e) { }
+        }
+        const req = http.get(`http://127.0.0.1:${p}/api/connectors`, (res) => {
+            port = p;
+            res.destroy();
+            resolve(true);
+        });
+        req.on("error", () => resolve(false));
+    });
+    if (!isRunning) {
+        console.log("  \x1b[90mStarting LDP background daemon...\x1b[0m");
+        const { fileURLToPath } = await import("url");
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirname = path.dirname(__filename);
+        const scriptPath = path.join(__dirname, "..", "ldp_server.py");
+        const child = spawn("python3", [scriptPath], { detached: true, stdio: 'ignore' });
+        child.unref();
+        // wait a moment for it to write the port file
+        await new Promise(r => setTimeout(r, 1000));
+        if (fs.existsSync(portFile)) {
+            try {
+                port = parseInt(fs.readFileSync(portFile, "utf-8").trim(), 10) || 8765;
+            }
+            catch (e) { }
+        }
+    }
+    console.log(`\n  \x1b[1mOpening LDP Desktop Dashboard\x1b[0m`);
+    console.log(`  Running on port: \x1b[33m${port}\x1b[0m`);
+    console.log(`  If browser doesn't open, visit: \x1b[36mhttp://127.0.0.1:${port}\x1b[0m\n`);
+    const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    exec(`${openCmd} http://127.0.0.1:${port}`);
+}
 async function main() {
     switch (cmd) {
         case "start":
@@ -96,8 +143,11 @@ async function main() {
         case "audit":
             audit();
             break;
+        case "dashboard":
+            await dashboard();
+            break;
         default:
-            console.log("  Usage: ldp <start|connect|query|status|audit>");
+            console.log("  Usage: ldp <start|connect|query|status|audit|dashboard>");
     }
 }
 main().catch(console.error);

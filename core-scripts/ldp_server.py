@@ -99,50 +99,9 @@ class LDPSecurityEnforcer:
 
 security_enforcer = LDPSecurityEnforcer()
 
-DISCOVERED_APPS = {} # name_key -> bool 
-DISCOVERED_EXPORTS = {} # export_name -> category
-PLATFORM = platform.system().lower() # 'darwin', 'linux', 'windows'
-
-SIGNAL_CONFIG = HOME / "Library/Application Support/Signal/config.json"
-SIGNAL_DB = HOME / "Library/Application Support/Signal/sql/db.sqlite"
-if PLATFORM == "windows":
-    SIGNAL_CONFIG = Path(os.getenv("APPDATA", "")) / "Signal/config.json"
-    SIGNAL_DB = Path(os.getenv("APPDATA", "")) / "Signal/sql/db.sqlite"
-
-def get_platform_paths():
-    """Returns platform-specific base paths for common apps."""
-    if PLATFORM == "darwin":
-        return {
-            "chrome": HOME / "Library/Application Support/Google/Chrome",
-            "brave": HOME / "Library/Application Support/BraveSoftware/Brave-Browser",
-            "edge": HOME / "Library/Application Support/Microsoft Edge",
-            "vscode": HOME / "Library/Application Support/Code/User/globalStorage/state.vscdb",
-            "cursor": HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-            "imessage": HOME / "Library/Messages/chat.db",
-            "notes": HOME / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
-            "mail": HOME / "Library/Mail",
-        }
-    elif PLATFORM == "windows":
-        appdata = Path(os.getenv("APPDATA", ""))
-        localapp = Path(os.getenv("LOCALAPPDATA", ""))
-        return {
-            "chrome": localapp / "Google/Chrome/User Data",
-            "brave": localapp / "BraveSoftware/Brave-Browser/User Data",
-            "edge": localapp / "Microsoft/Edge/User Data",
-            "vscode": appdata / "Code/User/globalStorage/state.vscdb",
-            "cursor": appdata / "Cursor/User/globalStorage/state.vscdb",
-        }
-    else: # Linux/Other
-        config = Path(os.getenv("XDG_CONFIG_HOME", HOME / ".config"))
-        return {
-            "chrome": config / "google-chrome",
-            "brave": config / "BraveSoftware/Brave-Browser",
-            "edge": config / "microsoft-edge",
-            "vscode": config / "Code/User/globalStorage/state.vscdb",
-            "cursor": config / "Cursor/User/globalStorage/state.vscdb",
-        }
-
-PLATFORM_PATHS = get_platform_paths()
+# PLATFORM_PATHS removed in Phase 14 to allow for true auto-discovery.
+# All data locations are now managed by brain_knowledge.json.
+DYNAMIC_PATHS = {} # tool_name -> file_path
 
 # ── Approval Management ──────────────────────────────────────────
 
@@ -298,54 +257,12 @@ class ApprovalManager:
 
 approvals = ApprovalManager()
 
-def find_browser_history(browser: str) -> list[Path]:
-    """Finds all browser history paths across all profiles."""
-    if browser not in PLATFORM_PATHS: return []
-    base = PLATFORM_PATHS[browser]
-    if not base.exists(): return []
-    
-    found = []
-    # Profiles are usually subdirs. Look for 'History' file in them.
-    # On Windows/Linux, profiles are often in 'User Data' or similar.
-    search_dirs = [base]
-    if PLATFORM != "darwin": # Windows/Linux often have profiles directly in base or 'User Data'
-        search_dirs.append(base)
-    
-    # Common profile names to check first (fast)
-    for profile in ["Default", "Profile 1", "Profile 2", "Guest"]:
-        path = base / profile / "History"
-        if path.exists(): found.append(path)
-    
-    # Then glob for others
-    for p in base.glob("Profile *"):
-        path = p / "History"
-        if path.exists() and path not in found:
-            found.append(path)
-            
-    return found
+# --- Layer 9: Dynamic Tool Discovery (Rules 1-11) ---
 
-def find_mail_db() -> Optional[Path]:
-    mail_dir = PLATFORM_PATHS.get("mail")
-    if mail_dir is None: return None
-    if not isinstance(mail_dir, Path) or not mail_dir.exists(): return None
-    try:
-        v_dirs = sorted(list(mail_dir.glob("V*")), reverse=True)
-        for v in v_dirs:
-            db = v / "MailData/Envelope Index"
-            if db.exists(): return db
-    except: pass
-    return None
+# PLATFORM_PATHS and SOURCES were removed in Phase 14.
+# All app locations are now discovered by the Node.js scanner
+# and registered in DYNAMIC_PATHS via the list-tools.ts bridge.
 
-# ── Active Sources ────────────────────────────────────────────────
-SOURCES = {
-    "chrome": find_browser_history("chrome"),
-    "brave":  find_browser_history("brave"),
-    "edge":   find_browser_history("edge"),
-    "vscode": PLATFORM_PATHS.get("vscode", Path("")),
-    "cursor": PLATFORM_PATHS.get("cursor", Path("")),
-    "imessage": PLATFORM_PATHS.get("imessage", Path("")),
-    "notes": PLATFORM_PATHS.get("notes", Path("")),
-}
 
 # ── SQLite reader (lock-safe copy) ────────────────────────────────
 def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
@@ -377,41 +294,31 @@ def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
 # ── Tool implementations ──────────────────────────────────────────
 
 def tool_chrome_history(limit: int = 30) -> str:
-    # Ensure all components are lists before adding
-    c = SOURCES.get("chrome", [])
-    b = SOURCES.get("brave", [])
-    e = SOURCES.get("edge", [])
-    paths = (c if isinstance(c, list) else [c]) + \
-            (b if isinstance(b, list) else [b]) + \
-            (e if isinstance(e, list) else [e])
-    actual_paths = [p for p in paths if isinstance(p, Path) and p.exists()]
-    if not actual_paths:
+    """Read browser history from discovered browser databases."""
+    paths = []
+    for t in ["ldp_chrome_query", "ldp_brave_query", "ldp_edge_query"]:
+        p = DYNAMIC_PATHS.get(t)
+        if p and Path(p).exists(): paths.append(Path(p))
+    
+    if not paths:
         return "No browser history found (Chrome/Brave/Edge)."
     
     all_rows: List[Dict] = []
-    for path in actual_paths:
+    for path in paths:
         try:
+            # Browser history usually has a 'urls' table
             rows_data = read_sqlite(path, f"SELECT url, title, visit_count FROM urls ORDER BY visit_count DESC LIMIT {limit}")
             all_rows.extend(rows_data)
         except: continue
     
-    if not all_rows:
-        return "No history entries found."
-        
-    # Sort and limit combined results
+    if not all_rows: return "No history entries found."
     all_rows.sort(key=lambda x: x.get("visit_count", 0), reverse=True)
-    rows: List[Dict] = []
-    for i in range(min(len(all_rows), limit)):
-        r = all_rows[i]
-        if isinstance(r, dict):
-            rows.append(r)
     
     out = [f"{'URL':<60} {'VISITS':>6}"]
-    for r in rows:
-        url_str = str(r.get("url", ""))
-        url_cut = url_str[0:58] # type: ignore
+    for r in all_rows[:limit]:
+        url_str = str(r.get("url", ""))[:58]
         visits  = int(r.get("visit_count", 0))
-        out.append(f"{url_cut:<60} {visits:>6}") # type: ignore
+        out.append(f"{url_str:<60} {visits:>6}")
     return "\n".join(out)
 
 def tool_shell_history(limit: int = 50) -> str:
@@ -625,30 +532,13 @@ def tool_claude_history(limit: int = 20, query: str = "") -> str:
     # Filter by query if provided
     if query:
         q = query.lower()
-        results = [r for r in results if any(q in str(v).lower() for v in r.values())]
+        results = [r for r in results if any(q in str(v).lower() for v in r.items())]
     
-    if not results:
-        return "No Claude session data found."
-    
-    # Apply limit
-    limited = results[:limit]
-    
-    out = [f"Claude Desktop Data ({len(results)} items found, showing {len(limited)}):\n"]
-    for r in limited:
+    if not results: return "No Claude session data found."
+    out = [f"Claude Desktop Data ({len(results)} items found):\n"]
+    for r in results[:limit]:
         rtype = r.get("type", "unknown")
-        if rtype == "claude_session":
-            out.append(f"  📝 Session {r['session_id'][:16]}...")
-            out.append(f"     Workspace: {r['workspace_id'][:16]}...")
-            out.append(f"     Started: {r['first_start']}")
-            out.append(f"     Modified: {r['last_modified']}")
-        elif rtype == "mcp_config":
-            out.append(f"  ⚙️  MCP Config: {r['server_count']} servers registered")
-            for s in r["servers"]:
-                out.append(f"       - {s}")
-        elif rtype == "window_state":
-            out.append(f"  🪟 Window: {r}")
-        out.append("")
-    
+        out.append(f"  [{rtype}] {r}")
     return "\n".join(out)
 
 def tool_manage_approvals(action: str, category: str = "") -> str:
@@ -830,107 +720,20 @@ def tool_export_search(export_dir: Path, query: str = "") -> str:
     return "\n".join(results)
 
 def tool_discover_apps(at_startup: bool = False) -> str:
-    """Walk ALL of ~/Library/Application Support for .sqlite/.db files and register
-    any database with at least one table having more than 10 rows as an LDP tool."""
-    search_root = HOME / "Library" / "Application Support"
-    extensions = {".sqlite", ".db"}
-    
-    # Signal is known but requires consent — never auto-register
-    CONSENT_REQUIRED = {"signal", "whatsapp", "telegram"}
+    """Invokes the Node-based scanner for Rule 1-7 auto-discovery."""
+    if at_startup:
+        if (HOME / ".ldp" / "brain_knowledge.json").exists():
+            return "Knowledge Base Loaded."
+        return "New machine detected. Run ldp_discover_apps to profile."
 
-    found_paths: List[Path] = []
     try:
-        for dirpath, dirnames, filenames in os.walk(str(search_root)):
-            # Prune skip dirs in-place so os.walk doesn't descend into them
-            dirnames[:] = [d for d in dirnames if not any(s.lower() in d.lower() for s in WALK_SKIP_PATTERNS)]
-            for fname in filenames:
-                if any(s.lower() in fname.lower() for s in WALK_SKIP_PATTERNS):
-                    continue
-                if Path(fname).suffix.lower() in extensions:
-                    found_paths.append(Path(dirpath) / fname)
+        # Run the full scanner
+        subprocess.run(["npx", "tsx", str(CORE_SCRIPTS / "run-auto.ts")], cwd=str(CORE_SCRIPTS), capture_output=True)
+        rebuild_tools()
+        return "Auto-discovery completed! Dynamic connectors registered."
     except Exception as e:
-        sys.stderr.write(f"[LDP] Walk error: {e}\n")
-
-    count = 0
-    skipped_consent = 0
-    low_density = 0
-    results = []
-
-    for db_path in found_paths:
-        # Derive a friendly name — walk up the path for a meaningful folder name
-        parts = list(db_path.parts)
-        # Start from parent, skip generic folders and numeric IDs
-        GENERIC = {"databases", "sql", "data", "db", "appdata", "storage", "plugin_config", "partitions", "webex", "plugins"}
-        app_name = None
-        for part in reversed(parts[:-1]):  # skip the file itself
-            if part.lower() in GENERIC: continue
-            if part.isnumeric() or (len(part) > 20 and part.replace("-", "").isalnum()): continue
-            if part.lower().startswith("profile ") or part.lower() in ("default", "guest profile", "system profile"): continue
-            if part.lower() in ("library", "application support", "users"): break
-            app_name = part
-            break
-        if not app_name:
-            # Last resort: use db filename without extension
-            app_name = db_path.stem
-        name_key = app_name.lower().replace(" ", "_").replace(".", "_").replace("-", "_")
-        tool_name = f"ldp_{name_key}_query"
-
-        # Skip apps requiring consent (Signal etc)
-        if any(c in name_key for c in CONSENT_REQUIRED):
-            skipped_consent += 1
-            DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "requiresConsent": True}
-            continue
-
-        # Density check — skip if max rows <= 10 AND fewer than 5 tables
-        try:
-            peak, table_count = max_table_rows(db_path)
-        except:
-            peak, table_count = 0, 0
-
-        if peak <= 10 and table_count < 5:
-            low_density += 1
-            continue
-
-        # Check category approval
-        category = classify_app(name_key)
-        if approvals.is_denied(category):
-            skipped_consent += 1
-            continue
-        
-        # RULE 2: No on-the-fly prompts ever again. 
-        # If it's not denied, it flows down and auto-registers.
-
-        # Register app
-        DISCOVERED_APPS[name_key] = {"sourcePath": str(db_path), "peak_rows": peak}
-
-        if not any(t["name"] == tool_name for t in TOOLS): # type: ignore
-            TOOLS.append({ # type: ignore
-                "name": tool_name,
-                "description": f"Query {app_name} local database ({db_path.name}, {peak} max rows in a table)",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Optional SQL query. Leave empty for schema overview."},
-                        "limit": {"type": "integer", "default": 10}
-                    }
-                }
-            })
-            def create_handler(nk, path):
-                def handler(args):
-                    q = args.get("query", "")
-                    lim = args.get("limit", 10)
-                    if not q:
-                        q = f"SELECT name, type FROM sqlite_master WHERE type='table' LIMIT {lim}"
-                    return json.dumps(read_sqlite(path, q), indent=2)
-                return handler
-            TOOL_MAP[tool_name] = create_handler(name_key, db_path) # type: ignore
-            count += 1
-            results.append(f"  ✓ {app_name} ({db_path.name}, {peak} rows)")
-
-    summary = f"Full walk complete: {count} new apps registered, {skipped_consent} deferred (consent required), {low_density} skipped (low density)."
-    if results:
-        summary += "\n\nRegistered:\n" + "\n".join(results)
-    return summary
+        log_ldp_crash(f"Discovery failed: {e}")
+        return f"Discovery failed: {e}"
 
 def tool_query_app(app_name: str, query: str = "", limit: int = 10) -> str:
     """Dynamically query a discovered app. Handles decryption automatically."""
@@ -1111,16 +914,10 @@ def tool_diagnostics() -> str:
 ALL_STATIC_TOOLS = [
     {"name": "ldp_diagnostics", "description": "Check LDP server status and version.", "inputSchema": {"type":"object"}},
     {"name": "ldp_check_permissions", "description": "Check Mac Full Disk Access permissions.", "inputSchema": {"type":"object"}},
+    {"name": "ldp_system_health", "description": "Check LDP health, logs, and crashes.", "inputSchema": {"type":"object"}},
     {"name": "ldp_global_search", "description": "Search across all local history/data.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
     {"name": "ldp_query_app", "description": "Query any discovered app (Signal, Chrome etc)", "inputSchema": {"type":"object", "properties": {"app_name": {"type":"string"}, "query":{"type":"string"}}}},
     {"name": "ldp_discover_apps", "description": "Scan Mac for local data apps", "inputSchema": {"type":"object"}},
-    {"name": "ldp_installed_apps", "description": "List all apps in /Applications", "inputSchema": {"type":"object"}},
-    {"name": "ldp_chrome_history", "description": "Read browser history", "inputSchema": {"type":"object"}},
-    {"name": "ldp_shell_history", "description": "Read shell history", "inputSchema": {"type":"object"}},
-    {"name": "ldp_imessage_history", "description": "Read local iMessage history", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 50}, "query": {"type":"string"}}}},
-    {"name": "ldp_contacts_history", "description": "Search local Apple Contacts", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
-    {"name": "ldp_calendar_history", "description": "Read local Apple Calendar events", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 50}}}},
-    {"name": "ldp_claude_history", "description": "Read Claude Desktop local sessions, MCP config, and agent-mode history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer", "default": 20}, "query": {"type":"string", "description": "Optional text filter"}}}},
     {"name": "ldp_manage_approvals", "description": "Revoke, reapprove, or reset your LDP category approvals live.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string", "enum": ["revoke", "reapprove", "reset"]}, "category": {"type": "string", "description": "The category (e.g., browser, system, work) for revoke/reapprove"}}}},
 ]
 
@@ -1128,67 +925,64 @@ TOOLS = []
 
 def rebuild_tools():
     """Live-rebuilds the TOOLS array exposed to MCP based on approvals/pauses."""
-    global TOOLS
+    global TOOLS, DYNAMIC_PATHS
     new_tools = []
+    new_paths = {}
     
     STATIC_MAP = {
         "ldp_diagnostics": "system",
         "ldp_check_permissions": "system",
+        "ldp_system_health": "system",
         "ldp_global_search": "system",
         "ldp_query_app": "system",
         "ldp_discover_apps": "system",
-        "ldp_installed_apps": "system",
         "ldp_manage_approvals": "system",
-        "ldp_chrome_history": "browser",
-        "ldp_shell_history": "system",
-        "ldp_claude_history": "exports",
-        "ldp_imessage_history": "communication",
-        "ldp_calendar_history": "work",
-        "ldp_contacts_history": "work",
     }
     
+    # 1. Register base system tools
     for st in ALL_STATIC_TOOLS:
         cat = STATIC_MAP.get(st["name"], "unknown")
         if cat != "system":
             if approvals.is_app_denied(st["name"], cat) or approvals.is_app_paused(st["name"]): continue
         new_tools.append(st)
-        
-    for name_key in DISCOVERED_APPS.keys():
-        cat = classify_app(name_key)
-        t_name = f"ldp_{name_key}_query"
-        if cat != "system":
-            if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
-        new_tools.append({
-            "name": t_name,
-            "description": f"Query {name_key} local database...",
-            "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}, "limit": {"type":"integer", "default": 10}}}
-        })
-        
-    for name_key, cat in DISCOVERED_EXPORTS.items():
-        t_name = f"ldp_export_{name_key.replace('-','_')}_query"
-        cat = "exports"
-        if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
-        new_tools.append({
-            "name": t_name,
-            "description": f"Search exported data archive.",
-            "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}
-        })
+    
+    # 2. Register dynamic apps from Brain
+    try:
+        res = subprocess.run(["npx", "tsx", str(CORE_SCRIPTS / "list-tools.ts")], cwd=str(CORE_SCRIPTS), capture_output=True, text=True)
+        if res.returncode == 0:
+            discovered = json.loads(res.stdout)
+            for d in discovered:
+                # Handle path expansion
+                f_path = d['path'].replace("~", str(HOME))
+                if "**" in f_path:
+                    # Very simple glob approximation for the server
+                    root = Path(f_path.split("**")[0])
+                    pattern = f_path.split("**")[1].lstrip("/")
+                    matches = list(root.glob(f"**/{pattern}")) if root.exists() else []
+                    if matches: f_path = str(matches[0])
+                
+                t_name = f"ldp_{d['name']}_query"
+                new_paths[t_name] = f_path
+                cat = classify_app(d['name'])
+                if approvals.is_app_denied(t_name, cat) or approvals.is_app_paused(t_name): continue
+                new_tools.append({
+                    "name": t_name,
+                    "description": f"Query {d['app']} local data ({f_path})",
+                    "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}, "limit": {"type":"integer", "default": 10}}}
+                })
+    except Exception as e:
+        sys.stderr.write(f"[LDP] rebuild_tools error: {e}\n")
         
     TOOLS[:] = new_tools
+    DYNAMIC_PATHS.update(new_paths)
 
 TOOL_MAP = {
     "ldp_diagnostics": lambda a: tool_diagnostics(),
     "ldp_check_permissions": lambda a: tool_check_permissions(),
+    "ldp_system_health": lambda a: tool_system_health(),
     "ldp_global_search": lambda a: tool_global_search(a.get("query","")),
     "ldp_query_app": lambda a: tool_query_app(a.get("app_name",""), a.get("query","")),
     "ldp_discover_apps": lambda a: tool_discover_apps(),
-    "ldp_installed_apps": lambda a: tool_installed_apps(),
-    "ldp_chrome_history": lambda a: tool_chrome_history(),
-    "ldp_shell_history": lambda a: tool_shell_history(),
-    "ldp_imessage_history": lambda a: tool_imessage_history(a.get("limit", 50), a.get("query", "")),
-    "ldp_contacts_history": lambda a: tool_contacts_history(a.get("query", "")),
-    "ldp_calendar_history": lambda a: tool_calendar_history(a.get("limit", 50)),
-    "ldp_claude_history": lambda a: tool_claude_history(a.get("limit", 20), a.get("query", "")),
     "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
 }
 
@@ -1217,24 +1011,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             
             d_state = { "tools": {} }
-            STATIC_MAP = {
-        "ldp_diagnostics": "system",
-        "ldp_check_permissions": "system",
-        "ldp_global_search": "system",
-        "ldp_query_app": "system",
-        "ldp_discover_apps": "system",
-        "ldp_installed_apps": "system",
-        "ldp_manage_approvals": "system",
-        "ldp_chrome_history": "browser",
-        "ldp_shell_history": "system",
-        "ldp_claude_history": "exports",
-        "ldp_imessage_history": "communication",
-        "ldp_calendar_history": "work",
-        "ldp_contacts_history": "work",
-            }
             
             def add_tool_state(name, cat):
-                if cat == "system": return
                 # Using our overrides or category approvals
                 approved = not approvals.is_app_denied(name, cat)
                 paused = approvals.is_app_paused(name)
@@ -1254,10 +1032,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "paused": paused,
                     "can_retry": can_retry
                 }
-                
-            for st in ALL_STATIC_TOOLS: add_tool_state(st["name"], STATIC_MAP.get(st["name"], "unknown"))
-            for name_key in DISCOVERED_APPS.keys(): add_tool_state(f"ldp_{name_key}_query", classify_app(name_key))
-            for name_key, cat in DISCOVERED_EXPORTS.items(): add_tool_state(f"ldp_export_{name_key.replace('-','_')}_query", "exports")
+            
+            # Fetch tools via the same bridge
+            try:
+                res = subprocess.run(["npx", "tsx", str(CORE_SCRIPTS / "list-tools.ts")], cwd=str(CORE_SCRIPTS), capture_output=True, text=True)
+                if res.returncode == 0:
+                    discovered = json.loads(res.stdout)
+                    for d in discovered:
+                        name = f"ldp_{d['name']}_query"
+                        cat = classify_app(d['name'])
+                        add_tool_state(name, cat)
+            except: pass
             
             self.wfile.write(json.dumps(d_state).encode())
             

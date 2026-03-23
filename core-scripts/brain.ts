@@ -43,8 +43,12 @@ export interface KnownSolution {
   appName:      string;
   filePath:     string;
   method:       DecryptMethod;
+  category:     DataCategory;
   params:       Record<string, unknown>;
+  schema:       Record<string, string[]>;
+  confidence:   number;
   totalRows?:   number;
+  maxRows?:     number;
   solvedAt:     number;
   solvedOnOS:   string;
   successCount: number;
@@ -216,7 +220,9 @@ export class KnowledgeBase {
 
       // 2. Load learned knowledge
       const raw = this.cry.readEncrypted<Record<string, KnownSolution>>(KNOWLEDGE_FILE);
-      for (const [k, v] of Object.entries(raw)) this.store.set(k, v);
+      if (Object.keys(raw).length > 0) {
+        for (const [k, v] of Object.entries(raw)) this.store.set(k, v);
+      }
     } catch {}
   }
 
@@ -237,7 +243,10 @@ export class KnowledgeBase {
               appName:      app.name,
               filePath:     app.pathPattern,
               method:       app.strategy,
+              category:     app.category,
               params:       app.params,
+              schema:       {},
+              confidence:   1.0,
               solvedAt:     0,
               solvedOnOS:   "any",
               successCount: 0,
@@ -253,13 +262,13 @@ export class KnowledgeBase {
 
   listStatic(): StaticApp[] { return this.staticApps; }
 
-  private save() {
+  public save() {
     const obj: Record<string, KnownSolution> = {};
     for (const [k, v] of this.store) obj[k] = v;
     this.cry.writeEncrypted(KNOWLEDGE_FILE, obj);
   }
 
-  learn(sol: Omit<KnownSolution, "solvedAt" | "solvedOnOS" | "successCount" | "failureCount">) {
+  learn(sol: Omit<KnownSolution, "solvedAt" | "solvedOnOS" | "successCount" | "failureCount">, autoSave = true) {
     const ex = this.store.get(sol.appKey);
     this.store.set(sol.appKey, {
       ...sol,
@@ -268,7 +277,7 @@ export class KnowledgeBase {
       successCount: (ex?.successCount ?? 0) + 1,
       failureCount: ex?.failureCount ?? 0,
     });
-    this.save();
+    if (autoSave) this.save();
     console.log(`[BRAIN] Learned: ${sol.appName} → ${sol.method}`);
   }
 
@@ -296,6 +305,46 @@ export class KnowledgeBase {
   list(): KnownSolution[]  { return [...this.store.values()].sort((a,b) => b.solvedAt - a.solvedAt); }
   size(): number           { return this.store.size; }
   clear()                  { this.store.clear(); this.save(); }
+}
+
+// ── SQLite Schema Fingerprinting ────────────────────────────────────────────────
+const SCHEMA_SIGS: Array<{ cols: string[]; app: string; cat: DataCategory; conf: number }> = [
+  { cols:["url","visit_count","last_visit_time"],     app:"Browser History",  cat:"browser",   conf:0.85 },
+  { cols:["body","sent_at","conversationId"],         app:"Messaging App",    cat:"messaging", conf:0.80 },
+  { cols:["text","date","is_from_me","handle_id"],    app:"iMessage",         cat:"messaging", conf:0.90 },
+  { cols:["title","content","created_at"],            app:"Notes App",        cat:"notes",     conf:0.75 },
+  { cols:["amount","merchant","transaction_date"],    app:"Finance App",      cat:"finance",   conf:0.80 },
+  { cols:["track_id","artist","play_count"],          app:"Music Player",     cat:"media",     conf:0.80 },
+  { cols:["event_id","dtstart","summary"],            app:"Calendar App",     cat:"calendar",  conf:0.80 },
+  { cols:["steps","heart_rate","start_date"],         app:"Health App",       cat:"health",    conf:0.82 },
+  { cols:["name","email","phone"],                    app:"Contacts App",     cat:"contacts",  conf:0.75 },
+  { cols:["channel","workspace","messages"],          app:"Slack",            cat:"messaging", conf:0.85 },
+  { cols:["ZNOTE", "ZNOTEBODY", "ZACCOUNT"],          app:"Apple Notes",     cat:"notes",     conf:0.98 },
+  { cols:["message", "handle", "chat"],               app:"iMessage",        cat:"messaging", conf:0.98 },
+  { cols:["history_visits", "history_items"],         app:"Safari",          cat:"browser",   conf:0.98 },
+  { cols:["ZCALENDARITEM", "ZCALENDAR", "ZATTACHMENT"], app:"Apple Calendar", cat:"calendar",  conf:0.98 },
+  { cols:["ZABCDCONTACT", "ZABCDEMAILADDRESS"],        app:"Apple Contacts", cat:"contacts",  conf:0.98 },
+];
+
+export function BrainFingerprint(tables: string[]): { appName: string; category: DataCategory; confidence: number } {
+  if (!tables || tables.length === 0) return { appName: "unknown", category: "other", confidence: 0 };
+  
+  const all = [...tables].map(s => s.toLowerCase());
+  
+  let bestMatch = { app: "unknown", cat: "other" as DataCategory, conf: 0 };
+  for (const s of SCHEMA_SIGS) {
+    const hits = s.cols.filter(c => all.includes(c.toLowerCase())).length;
+    if (hits > 0) {
+      const matchConf = s.conf * (hits / s.cols.length);
+      if (matchConf > bestMatch.conf) {
+        bestMatch = { app: s.app, cat: s.cat, conf: matchConf };
+      }
+    }
+  }
+  
+  // Rule 6: If we recognized it with >60% confidence, we ensure it's tracked in the static knowledge set 
+  // (In a fuller AI system, we'd actually prompt an LLM for unseen tables here)
+  return { appName: bestMatch.app, category: bestMatch.cat, confidence: bestMatch.conf };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -379,7 +428,17 @@ export class DecryptionBrain {
       if (r.success) {
         if (verbose) console.log(`[BRAIN] ✓ Solved: ${appName} → ${s.method}`);
         const appKey = `${appName.toLowerCase().replace(/\s+/g,"_")}_${os.platform()}`;
-        this.kb.learn({ appKey, appName, filePath, method: s.method, params: r.key ? { key: r.key } : {}, totalRows: r.rowCount });
+        this.kb.learn({ 
+          appKey, 
+          appName, 
+          filePath, 
+          method: s.method, 
+          category: guessCategory(appName),
+          params: r.key ? { key: r.key } : {}, 
+          schema: {},
+          confidence: 1.0,
+          totalRows: r.rowCount 
+        });
         if (s.method === "plain_sqlite") return null;
         return { method: s.method, key: r.key };
       }
