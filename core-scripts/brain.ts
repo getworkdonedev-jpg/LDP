@@ -590,6 +590,24 @@ async function askAI(
 export async function identifyWithTeachers(schemaContext: any, counts: any, filePath: string): Promise<AppIdentity | null> {
   const schema = { tables: Object.keys(schemaContext), columns: schemaContext, rowCounts: counts };
 
+  // Step 0: Known-pattern skip — never call any AI for these
+  const fp = filePath.toLowerCase();
+  if (fp.includes("state.vscdb") || fp.includes("workspacestorage")) {
+    return { appName: "VS Code/Cursor Workspace", confidence: 0.97, category: "developer" as DataCategory, tableDescriptions: {}, safeToRead: true, suggestedToolName: "ldp_vscode_workspaces_query", source: "pattern" };
+  }
+  if (fp.includes("/chrome/") || fp.includes("/brave/") || fp.includes("/chromium/")) {
+    return { appName: "Chrome/Brave", confidence: 0.95, category: "browser" as DataCategory, tableDescriptions: {}, safeToRead: true, suggestedToolName: "ldp_chrome_history_query", source: "pattern" };
+  }
+  if (fp.includes("/zoom.us/")) {
+    return { appName: "Zoom", confidence: 0.93, category: "other" as DataCategory, tableDescriptions: {}, safeToRead: false, suggestedToolName: "", source: "pattern" };
+  }
+  if (fp.includes("/jetbrains/") || fp.includes("/pycharm") || fp.includes("/intellij")) {
+    return { appName: "JetBrains IDE", confidence: 0.93, category: "developer" as DataCategory, tableDescriptions: {}, safeToRead: true, suggestedToolName: "", source: "pattern" };
+  }
+  if (fp.includes("/discord/")) {
+    return { appName: "Discord", confidence: 0.95, category: "messaging" as DataCategory, tableDescriptions: {}, safeToRead: true, suggestedToolName: "ldp_discord_query", source: "pattern" };
+  }
+
   // Level 1: Groq
   if (await detectProvider("groq")) {
     try {

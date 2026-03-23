@@ -382,21 +382,21 @@ function identifyByFingerprint(filePath: string) {
 
   // 2. Try dynamic brain knowledge
   const brain = new LDPBrain();
-  const staticApps = brain.knowledge.listStatic(); 
+  const staticApps = brain.knowledge.list(); 
   for (const app of staticApps) {
     // Convert glob-like pattern to regex simple
-    const regex = new RegExp(app.pathPattern.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*"), "i");
+    const regex = new RegExp(app.filePath.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*"), "i");
     if (regex.test(filePath)) {
       return {
         pattern: regex,
-        app: app.name,
+        app: app.appName,
         category: app.category,
         permissions: [`${app.category}.read`],
-        namedQueries: { all: `All records from ${app.name}` },
+        namedQueries: { all: `All records from ${app.appName}` },
         connectionHints: {
-            encryption: app.strategy === "plain_sqlite" ? "none" : "sqlcipher",
-            autoRegister: app.autoRegister,
-            requiresConsent: app.requiresConsent
+            encryption: app.method === "plain_sqlite" ? "none" : "sqlcipher",
+            autoRegister: (app.params?.autoRegister ?? true),
+            requiresConsent: (app.params?.requiresConsent ?? false)
         }
       };
     }

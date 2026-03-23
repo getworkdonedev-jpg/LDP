@@ -608,6 +608,17 @@ export class SystemScanner {
       if (this.opts.verbose) console.log(`[SCAN] Process recheck: ${item.path} (${item.reason})`);
       kb.removeFromQueue(item.path);
 
+      // Short-circuit: resolve known patterns without any AI call
+      const fpLow = item.path.toLowerCase();
+      if (fpLow.includes("state.vscdb") || fpLow.includes("workspacestorage")) {
+        if (this.opts.verbose) console.log(`[SCAN] Pattern resolved: VS Code/Cursor → ${item.path}`);
+        continue; // already handled by PATH_SIGS at scan time; don't re-add
+      }
+      if (fpLow.includes("/zoom.us/") || fpLow.includes("/jetbrains/") || fpLow.includes("/pycharm")) {
+        if (this.opts.verbose) console.log(`[SCAN] Pattern resolved: known app → ${item.path}`);
+        continue;
+      }
+
       if (!fs.existsSync(item.path)) continue;
       const ft = fingerprint(item.path);
       if (ft !== "sqlite") continue;

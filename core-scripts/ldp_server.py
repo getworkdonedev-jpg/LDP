@@ -5,7 +5,7 @@ Reads: Chrome history, shell history, VS Code recent files,
        git log, terminal commands, any SQLite on your Mac.
 """
 
-import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform
+import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform, glob
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional, Union, Dict, Any
@@ -986,9 +986,62 @@ ALL_STATIC_TOOLS = [
     {"name": "ldp_query_app", "description": "Query any discovered app (Signal, Chrome etc)", "inputSchema": {"type":"object", "properties": {"app_name": {"type":"string"}, "query":{"type":"string"}}}},
     {"name": "ldp_discover_apps", "description": "Scan Mac for local data apps", "inputSchema": {"type":"object"}},
     {"name": "ldp_manage_approvals", "description": "Revoke, reapprove, or reset your LDP category approvals live.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string", "enum": ["revoke", "reapprove", "reset"]}, "category": {"type": "string", "description": "The category (e.g., browser, system, work) for revoke/reapprove"}}}},
+    {"name": "ldp_active_app", "description": "What app is active right now, window title, URL if browser, time in this app", "inputSchema": {"type":"object","properties":{}}},
+    {"name": "ldp_screen_today", "description": "Time spent in every app today with percentages.", "inputSchema": {"type":"object","properties":{}}},
+    {"name": "ldp_screen_history", "description": "Full timeline of app switches. Filter by app name with app parameter.", "inputSchema": {"type":"object","properties":{"limit":{"type":"number"},"app":{"type":"string"}}}},
+    {"name": "ldp_context_now", "description": "Complete current context — active app + today summary + recent messages. LDP's awareness layer.", "inputSchema": {"type":"object","properties":{}}},
 ]
 
 TOOLS = []
+
+def make_tool_handler(tool_name):
+    def handler(args):
+        limit = args.get('limit', 20)
+        try:
+            import shutil, tempfile, sqlite3, os, json
+            brain_path = os.path.expanduser(
+                '~/Desktop/LDP/core-scripts/brain_knowledge.json')
+            with open(brain_path) as f:
+                brain = json.load(f)
+            db_path = None
+            for key, val in brain.get('learned', {}).items():
+                if val.get('appName','').lower().replace(' ','_') \
+                   in tool_name:
+                    db_path = val.get('filePath','')
+                    break
+            if not db_path: return f"Not found: {tool_name}"
+            tmp = tempfile.mktemp(suffix='.db')
+            shutil.copy2(os.path.expanduser(db_path), tmp)
+            conn = sqlite3.connect(tmp)
+            cur = conn.cursor()
+            tables = [r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            best,count = tables[0],0
+            for t in tables:
+                try:
+                    n=cur.execute(
+                        f"SELECT count(*) FROM [{t}]"
+                    ).fetchone()[0]
+                    if n>count: count,best=n,t
+                except: pass
+            rows=cur.execute(
+                f"SELECT * FROM [{best}] LIMIT {limit}"
+            ).fetchall()
+            cols=[r[1] for r in cur.execute(
+                f"PRAGMA table_info([{best}])"
+            )]
+            conn.close()
+            os.unlink(tmp)
+            out=f"{best}: {count} rows\n"
+            out+=" | ".join(cols)+"\n---\n"
+            for r in rows:
+                out+=" | ".join(str(v)[:40] if v 
+                                else '' for v in r)+"\n"
+            return out
+        except Exception as e:
+            return f"Error: {e}"
+    return handler
 
 def rebuild_tools():
     """Live-rebuilds the TOOLS array exposed to MCP based on approvals/pauses."""
@@ -1042,6 +1095,248 @@ def rebuild_tools():
         
     TOOLS[:] = new_tools
     DYNAMIC_PATHS.update(new_paths)
+    
+    # Auto-register handlers for all tools missing one
+    for tool in TOOLS:
+        if tool['name'] not in TOOL_MAP:
+            TOOL_MAP[tool['name']] = make_tool_handler(tool['name'])
+
+# ── Screen Watcher ─────────────────────────────────────────────────
+import time as _time
+
+class ScreenWatcher:
+    def __init__(self):
+        self.log_path = os.path.expanduser("~/.ldp/activity_log.jsonl")
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        self.running = False
+        self.current = {"app": "", "window": "", "url": "", "since": _time.time()}
+        self.last_app = ""
+        self.app_start = _time.time()
+
+    def start(self):
+        self.running = True
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _get_context(self):
+        script = '''tell application "System Events"
+    set frontApp to name of first application process whose frontmost is true
+    set winTitle to ""
+    try
+        set winTitle to name of front window of process frontApp
+    end try
+    return frontApp & "|||" & winTitle
+end tell'''
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                parts = r.stdout.strip().split("|||")
+                return {"app": parts[0].strip() if parts else "",
+                        "window": parts[1].strip() if len(parts) > 1 else ""}
+        except Exception:
+            pass
+        return None
+
+    def _get_browser_url(self, app):
+        if "Chrome" not in app and "Safari" not in app:
+            return ""
+        browser = "Google Chrome" if "Chrome" in app else "Safari"
+        script = f'tell application "{browser}"\nif it is running then\nreturn URL of active tab of front window\nend if\nend tell'
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _watch(self):
+        while self.running:
+            try:
+                ctx = self._get_context()
+                if ctx and ctx["app"]:
+                    app = ctx["app"]
+                    if app != self.last_app:
+                        duration = int(_time.time() - self.app_start)
+                        entry = {
+                            "time": datetime.now().isoformat(),
+                            "app": self.last_app,
+                            "window": self.current.get("window", ""),
+                            "url": self.current.get("url", ""),
+                            "seconds": duration
+                        }
+                        if self.last_app:
+                            with open(self.log_path, "a") as f:
+                                f.write(json.dumps(entry) + "\n")
+                        url = self._get_browser_url(app)
+                        self.current = {"app": app, "window": ctx["window"],
+                                        "url": url, "since": _time.time()}
+                        self.last_app = app
+                        self.app_start = _time.time()
+                    else:
+                        self.current["window"] = ctx["window"]
+            except Exception:
+                pass
+            _time.sleep(3)
+
+    def now(self):
+        c = self.current
+        secs = int(_time.time() - c.get("since", _time.time()))
+        mins = secs // 60
+        return {"app": c.get("app", ""), "window": c.get("window", ""),
+                "url": c.get("url", ""), "duration": f"{mins}m {secs%60}s"}
+
+    def today_summary(self):
+        if not os.path.exists(self.log_path):
+            return {}
+        today = datetime.now().date().isoformat()
+        app_times = {}
+        with open(self.log_path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if e["time"].startswith(today):
+                        app = e["app"]
+                        app_times[app] = app_times.get(app, 0) + e.get("seconds", 0)
+                except Exception:
+                    pass
+        current = self.now()
+        if current["app"]:
+            cur_secs = int(_time.time() - self.current.get("since", _time.time()))
+            app_times[current["app"]] = app_times.get(current["app"], 0) + cur_secs
+        return dict(sorted(app_times.items(), key=lambda x: -x[1]))
+
+    def history(self, limit=50):
+        if not os.path.exists(self.log_path):
+            return []
+        with open(self.log_path) as f:
+            lines = f.readlines()
+        entries = []
+        for line in reversed(lines[-limit:]):
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+        return entries
+
+    def rotate_log(self):
+        if not os.path.exists(self.log_path):
+            return
+        cutoff = _time.time() - (30 * 86400)
+        kept = []
+        with open(self.log_path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    t = datetime.fromisoformat(e["time"]).timestamp()
+                    if t > cutoff:
+                        kept.append(line)
+                except Exception:
+                    pass
+        with open(self.log_path, "w") as f:
+            f.writelines(kept)
+
+watcher = ScreenWatcher()
+
+def tool_active_app(args):
+    now = watcher.now()
+    if not now["app"]:
+        return "No active app detected (Accessibility permission may be needed)"
+    out = f"Active app: {now['app']}\n"
+    out += f"Window:     {now['window']}\n"
+    out += f"Time in app: {now['duration']}\n"
+    if now["url"]:
+        out += f"URL:        {now['url']}\n"
+    return out
+
+def tool_screen_today(args):
+    summary = watcher.today_summary()
+    if not summary:
+        return "No activity recorded today yet. Watcher started at server launch."
+    out = "Time spent today:\n\n"
+    total = sum(summary.values())
+    for app, secs in summary.items():
+        mins = secs // 60
+        hrs = mins // 60
+        pct = int((secs / total) * 100) if total else 0
+        time_str = f"{hrs}h {mins%60}m" if hrs > 0 else f"{mins}m"
+        out += f"  {app}: {time_str} ({pct}%)\n"
+    total_hrs = total // 3600
+    total_mins = (total % 3600) // 60
+    out += f"\nTotal tracked: {total_hrs}h {total_mins}m"
+    return out
+
+def tool_screen_history(args):
+    limit = int(args.get("limit", 30))
+    app_filter = args.get("app", "").lower()
+    entries = watcher.history(limit)
+    if not entries:
+        return "No screen history yet. Watcher logs app switches to ~/.ldp/activity_log.jsonl."
+    out = "Recent activity:\n\n"
+    for e in entries:
+        if app_filter and app_filter not in e.get("app", "").lower():
+            continue
+        secs_total = e.get("seconds", 0)
+        mins = secs_total // 60
+        secs = secs_total % 60
+        t = e["time"][11:16]
+        app = e.get("app", "")
+        win = e.get("window", "")[:35]
+        url = e.get("url", "")[:50]
+        out += f"{t}  {app}  {mins}m{secs}s"
+        if win:
+            out += f"  [{win}]"
+        if url:
+            out += f"\n      {url}"
+        out += "\n"
+    return out
+
+def tool_context_now(args):
+    now = watcher.now()
+    app = now.get("app", "")
+    context = "RIGHT NOW:\n"
+    context += f"App:      {app}\n"
+    context += f"Window:   {now.get('window', '')}\n"
+    if now.get("url"):
+        context += f"URL:      {now['url']}\n"
+    context += f"Time in app: {now.get('duration', '')}\n\n"
+
+    today = watcher.today_summary()
+    context += "TODAY SO FAR:\n"
+    for a, secs in list(today.items())[:5]:
+        context += f"  {a}: {secs//60}m\n"
+
+    try:
+        msg_db = os.path.expanduser("~/Library/Messages/chat.db")
+        tmp = tempfile.mktemp(suffix=".db")
+        shutil.copy2(msg_db, tmp)
+        conn = sqlite3.connect(tmp)
+        rows = conn.execute("""
+            SELECT text FROM message
+            WHERE text IS NOT NULL
+            AND date > (strftime('%s','now')-86400-978307200)*1000000000
+            ORDER BY date DESC LIMIT 5
+        """).fetchall()
+        conn.close()
+        os.unlink(tmp)
+        if rows:
+            context += "\nRECENT MESSAGES:\n"
+            for r in rows:
+                if r[0]:
+                    context += f"  {str(r[0])[:60]}\n"
+    except Exception:
+        pass
+
+    try:
+        hist = watcher.history(20)
+        recent_apps = list(dict.fromkeys([e["app"] for e in hist if e.get("app")]))[:5]
+        if recent_apps:
+            context += f"\nRECENT APPS: {', '.join(recent_apps)}\n"
+    except Exception:
+        pass
+
+    return context
 
 TOOL_MAP = {
     "ldp_diagnostics": lambda a: tool_diagnostics(),
@@ -1054,6 +1349,10 @@ TOOL_MAP = {
     "ldp_whatsapp_query": lambda a: tool_whatsapp_query(a),
     "ldp_signal_query": lambda a: tool_signal_query(a),
     "ldp_telegram_query": lambda a: tool_telegram_query(a),
+    "ldp_active_app": tool_active_app,
+    "ldp_screen_today": tool_screen_today,
+    "ldp_screen_history": tool_screen_history,
+    "ldp_context_now": tool_context_now,
 }
 
 import threading
@@ -1306,6 +1605,11 @@ def main():
     
     # Compile the live list of valid apps exposed to AI
     rebuild_tools()
+
+    # Start screen watcher daemon (Accessibility API, no recording)
+    watcher.start()
+    watcher.rotate_log()
+    sys.stderr.write("[LDP] Screen watcher started → ~/.ldp/activity_log.jsonl\n")
     
     if "--dashboard" in sys.argv:
         try:
