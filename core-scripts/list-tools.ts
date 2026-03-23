@@ -7,33 +7,63 @@ async function main() {
   const seenNames = new Set<string>();
   const finalTools: any[] = [];
 
-  // Core apps we ALWAYS want to keep
-  const coreApps = ["imessage", "notes", "safari", "whatsapp", "signal", "telegram", "calendar", "contacts", "mail", "vscode", "cursor", "git", "shell", "health", "system_health"];
+  // Core apps we ALWAYS want to keep (Fix 1 & 2)
+  const coreAppsMap: Record<string, string> = {
+    "chrome":     "chrome_history",
+    "shell":      "shell_history",
+    "git":        "git_log",
+    "imessage":   "imessage",
+    "notes":      "notes",
+    "safari":     "safari_history",
+    "calendar":   "calendar",
+    "contacts":   "contacts",
+    "reminders":  "reminders",
+    "mail":       "mail",
+    "whatsapp":   "whatsapp",
+    "signal":     "signal",
+    "telegram":   "telegram",
+    "vscode":     "vscode_workspaces",
+    "health":     "system_health",
+  };
 
   for (const sol of rawTools) {
-    let name = sol.appKey;
+    let rawName = sol.appKey.toLowerCase();
+    let name = rawName;
     
-    // Grouping / Deduping logic
-    if (name.includes("_state_vscdb")) name = "vscode_workspaces";
-    if (name.includes("_global_storage")) name = "vscode_global_storage";
-    if (name.includes("whatsapp") || sol.appName.toLowerCase().includes("whatsapp")) name = "whatsapp";
+    // Grouping / Deduping
+    if (name.includes("_state_vscdb") || name.includes("vscode")) name = "vscode";
+    if (name.includes("whatsapp")) name = "whatsapp";
+    if (name.includes("chrome") || (sol.appName.toLowerCase().includes("chrome") && name.includes("history"))) name = "chrome";
+    if (name.includes("zsh_history") || sol.appName.toLowerCase().includes("shell")) name = "shell";
+    if (name.includes(".git") || sol.appName.toLowerCase().includes("git")) name = "git";
 
     // Clean up names
     name = name.replace(/^static_|^path_|^auto_/, "");
     name = name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
     if (name.startsWith("apple_")) name = name.replace("apple_", "");
     
-    // Aggressive Noise Filter (Problem 3)
-    const noise = ["tomb", "backup", "cache", "thumbnail", "authorization", "akd", "siri", "heavy_ad", "tipkit", "dock", "vscdb", "metadata", "plist", "json", "coredatabackend"];
+    // Renaming to requested names
+    for (const [key, val] of Object.entries(coreAppsMap)) {
+      if (name.includes(key)) {
+        name = val;
+        break;
+      }
+    }
+
+    // Strict Noise Filter (Problem 3 & Fix 3)
+    const noise = ["tomb", "backup", "cache", "thumbnail", "authorization", "akd", "siri", "heavy_ad", "tipkit", "dock", "vscdb", "metadata", "plist", "json", "coredatabackend", "drivefs"];
     
-    const isCore = coreApps.some(a => name.includes(a) || sol.appName.toLowerCase().includes(a));
-    const isNoise = noise.some(n => name.includes(n) || sol.appName.toLowerCase().includes(n));
+    const isCore = Object.values(coreAppsMap).includes(name) || Object.keys(coreAppsMap).some(k => name.includes(k));
+    const isNoise = noise.some(n => name.toLowerCase().includes(n) || sol.appName.toLowerCase().includes(n) || sol.filePath.toLowerCase().includes(n));
     
-    // Skip noise unless it's a core app we forced inclusion for
+    // Skip if it is noise AND not a core app
     if (isNoise && !isCore) continue;
     
+    // Extra strict: if it has "drivefs" anywhere, skip it NO MATTER WHAT (Fix 3)
+    if (sol.filePath.toLowerCase().includes("drivefs") || name.includes("drivefs")) continue;
+
     // Skip generic plists/jsons/low-conf unless core
-    if ((sol.appKey.startsWith("static_") && (sol.appKey.includes("plist") || sol.appKey.includes("json"))) && !isCore) continue;
+    if (sol.appKey.startsWith("static_") && (sol.appKey.includes("plist") || sol.appKey.includes("json")) && !isCore) continue;
     if (name.startsWith("unknown") && sol.confidence < 0.5) continue;
 
     if (seenNames.has(name)) continue;
@@ -49,13 +79,11 @@ async function main() {
     });
   }
 
-  // Sort: Core first, then by confidence
-  finalTools.sort((a,b) => {
-    const aCore = coreApps.some(c => a.name.includes(c)) ? 1 : 0;
-    const bCore = coreApps.some(c => b.name.includes(c)) ? 1 : 0;
-    if (aCore !== bCore) return bCore - aCore;
-    return b.confidence - a.confidence;
-  });
+  // Final trim: if we have more than 22 tools, remove low confidence unknowns
+  if (finalTools.length > 22) {
+     finalTools.sort((a,b) => (Object.values(coreAppsMap).includes(b.name)?1:0) - (Object.values(coreAppsMap).includes(a.name)?1:0) || b.confidence - a.confidence);
+     // finalTools.splice(22); // No, let's keep all valid ones but name them nicely
+  }
 
   console.log(JSON.stringify(finalTools));
 }

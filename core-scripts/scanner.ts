@@ -65,6 +65,7 @@ export interface ScannedFile {
   totalRows:  number;
   maxRows:    number;
   staticMatch?: "mail" | "shell" | "git" | "logs" | "plist";
+  method: DecryptMethod;
 }
 
 export interface ProcessInfo {
@@ -128,10 +129,9 @@ const SKIP_DIRS = new Set([
 const SKIP_PATH_PATTERNS = [
   "/System/","/usr/","/private/var/","/Library/Caches/",
   "/.Spotlight-","/CoreData/","metadata.sqlite","CloudKitLocalStore",
-  "com.apple.bird","CoreDataUbiquitySupport",
-  "StoreKit.db", "DriveFS/root_preference_sqlite.db",
   "tomb","backup","cache","thumbnail","authorization",
-  "akd","siri_inference","heavy_ad","tipkit","dock_desktop"
+  "akd","siri_inference","heavy_ad","tipkit","dock_desktop",
+  "drivefs", "DriveFS"
 ];
 
 const DATA_EXTS = new Set([
@@ -323,7 +323,9 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any): P
     filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
     appName: path.basename(fp), category: "other", confidence: 0.1,
     tables: [], encrypted: ft === "sqlcipher", totalRows: 0, maxRows: 0,
+    method: "plain_sqlite"
   };
+  if (ft === "sqlcipher") base.method = "unknown";
 
   if (fp.endsWith(".emlx")) {
     const res = { ...base, appName:"Apple Mail", category:"messaging", confidence:1.0, staticMatch:"mail" } as ScannedFile;
@@ -670,15 +672,38 @@ export class SystemScanner {
       { path: path.join(h, "Library/Application Support/AddressBook/AddressBook-v22.abcddb"), app: "Apple Contacts" },
       { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlite"), app: "Reminders" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.journal/Journal.sqlite"), app: "Apple Journal" },
-      { path: path.join(h, "Music/Music/Music Library.musiclibrary/Library.sqlite"), app: "Apple Music" }
+      { path: path.join(h, "Music/Music/Music Library.musiclibrary/Library.sqlite"), app: "Apple Music" },
+      { path: path.join(h, "Library/Application Support/Google/Chrome/Default/History"), app: "Chrome" },
+      { path: path.join(h, "Library/Mail/V10/MailData/Envelope Index"), app: "Apple Mail" },
+      { path: path.join(h, ".zsh_history"), app: "Shell History" },
+      { path: path.join(h, ".git"), app: "Git Log" }
     ];
 
     for (const p of probes) {
       if (fs.existsSync(p.path)) {
         try {
           const stat = fs.statSync(p.path);
-          const ft = fingerprint(p.path);
+          const ft: any = p.path.endsWith(".git") ? "unknown" : fingerprint(p.path);
           const scanned = await analyseFile(p.path, stat, ft, learned);
+          
+          scanned.appName = p.app;
+          scanned.confidence = 1.0;
+          const slug = path.basename(scanned.filePath).toLowerCase().replace(/[^a-z0-9]/g,"_");
+          const appKey = `path_${scanned.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`;
+
+          learned.learn({
+            appKey,
+            filePath: scanned.filePath, 
+            appName: scanned.appName,
+            category: scanned.category, 
+            method: scanned.method,
+            params: {},
+            schema: {}, 
+            confidence: 1.0,
+            totalRows: scanned.totalRows || 0,
+            maxRows: scanned.maxRows || 0,
+          });
+
           if (scanned.confidence >= threshold) {
              result.databases.push(scanned);
              result.autoConnected.push(scanned.appName.toLowerCase().replace(/[^a-z0-9]/g, "_"));

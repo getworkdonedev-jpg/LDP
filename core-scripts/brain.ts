@@ -323,7 +323,8 @@ const SCHEMA_SIGS: Array<{ cols: string[]; app: string; cat: DataCategory; conf:
   { cols:["message", "handle", "chat"],               app:"iMessage",        cat:"messaging", conf:0.98 },
   { cols:["history_visits", "history_items"],         app:"Safari",          cat:"browser",   conf:0.98 },
   { cols:["ZCALENDARITEM", "ZCALENDAR", "ZATTACHMENT"], app:"Apple Calendar", cat:"calendar",  conf:0.98 },
-  { cols:["ZABCDCONTACT", "ZABCDEMAILADDRESS"],        app:"Apple Contacts", cat:"contacts",  conf:0.98 },
+  { cols:["ZABCDRECORD", "ZABCDEMAILADDRESS"],        app:"Apple Contacts", cat:"contacts",  conf:0.98 },
+  { cols:["ZREMCDREMINDER", "ZREMCDLIST", "ZREMCDACCOUNT"], app:"Apple Reminders", cat:"calendar", conf:0.98 },
 ];
 
 export function BrainFingerprint(tables: string[]): { appName: string; category: DataCategory; confidence: number } {
