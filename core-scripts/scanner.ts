@@ -679,8 +679,11 @@ export class SystemScanner {
       { path: path.join(h, "Library/Mail/V10/MailData/Envelope Index"), app: "Apple Mail" },
       { path: path.join(h, ".zsh_history"), app: "Shell History" },
       { path: "/Users/karthikperumalla/openfoodfacts-python/.git", app: "Git Log" },
+      { path: "/Users/karthikperumalla/Desktop/LDP/.git", app: "Git Log" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"), app: "Apple Calendar" },
-      { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlite"), app: "Reminders" }
+      { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlite"), app: "Reminders" },
+      { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlite"), app: "Reminders" },
+      { path: path.join(h, "Library/Reminders/Reminders.sqlite"), app: "Reminders" }
     ];
 
     for (const p of probes) {
