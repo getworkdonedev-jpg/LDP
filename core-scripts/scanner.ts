@@ -103,14 +103,15 @@ export interface ScanResult {
 }
 
 export interface SystemScannerOptions {
-  verbose?:              boolean;
   maxFiles?:             number;    // default 5000
   maxDepth?:             number;    // default 8
   autoConnectThreshold?: number;    // default 0.80
+  verbose?:              boolean;
   engine?:               InstanceType<typeof import("./engine.js").LDPEngine>;
   includeProcesses?:     boolean;   // default true
   includeNetwork?:       boolean;   // default true
   includeOpenFiles?:     boolean;   // default false (slow)
+  apiKey?:               string;    // Anthropic API Key for AI identification
 }
 
 // ── Skip lists ────────────────────────────────────────────────────────────────
@@ -160,7 +161,14 @@ function getScanRoots(): string[] {
 }
 
 function shouldSkip(name: string, full: string): boolean {
-  if (SKIP_DIRS.has(name)) return true;
+  const isKnownContainer = full.includes("group.net.whatsapp") || full.includes("group.org.telegram") || full.includes("Signal");
+  
+  if (SKIP_DIRS.has(name) && !isKnownContainer) return true;
+
+  // New Rule: skip UUID folders UNLESS parent is a known container
+  const looksLikeUuid = /[0-9a-fA-F]{8}-/.test(name);
+  if (looksLikeUuid && !isKnownContainer) return true;
+
   return SKIP_PATH_PATTERNS.some(p => full.includes(p));
 }
 
@@ -246,7 +254,7 @@ const PATH_SIGS: Array<{ pat: RegExp; app: string; cat: DataCategory; conf: numb
   { pat: /Chrome.*History|Brave.*History|Chromium.*History/i,   app:"Chrome/Brave",    cat:"browser",    conf:0.97 },
   { pat: /Firefox.*places\.sqlite/i,                            app:"Firefox",         cat:"browser",    conf:0.97 },
   { pat: /Signal.*db\.sqlite/i,                                  app:"Signal",          cat:"messaging",  conf:0.97 },
-  { pat: /WhatsApp.*ChatStorage/i,                               app:"WhatsApp",        cat:"messaging",  conf:0.97 },
+  { pat: /WhatsApp.*(ChatStorage|ContactsV2|CallHistory|ChatSearchV5f)/i, app:"WhatsApp", cat:"messaging",  conf:0.97 },
   { pat: /Telegram.*db_sqlite/i,                                 app:"Telegram",        cat:"messaging",  conf:0.95 },
   { pat: /Code.*globalStorage.*vscdb|Cursor.*globalStorage/i,   app:"VS Code/Cursor",  cat:"developer",  conf:0.97 },
   { pat: /Spotify.*podcasts\.db/i,                               app:"Spotify",         cat:"media",      conf:0.95 },
@@ -318,7 +326,7 @@ function readColumns(fp: string, tables: string[]): string[] {
 // Brain fingerprinting handler dynamically passed tables now
 // (Implemented across phase boundaries)
 
-async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any): Promise<ScannedFile> {
+async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, apiKey?: string): Promise<ScannedFile> {
   const base: ScannedFile = {
     filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
     appName: path.basename(fp), category: "other", confidence: 0.1,
@@ -383,24 +391,54 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any): P
   if (ft === "sqlite" && density.max >= 10) {
     // If table size >= 10, defer to Brain for identification
     const { BrainFingerprint } = require("./brain.js");
-    const ai = BrainFingerprint(tables);
+    
+    // Gather column context for first 3 tables
+    const schemaContext: Record<string, string[]> = {};
+    for (const t of tables.slice(0, 3)) {
+      schemaContext[t] = readColumns(fp, [t]);
+    }
+    
+    // Gather row counts for first 10 tables
+    const counts: Record<string, number> = {};
+    try {
+      const DB = require("better-sqlite3");
+      const db = new DB(fp, { readonly: true, timeout: 2000 });
+      for (const t of tables.slice(0, 10)) {
+        try {
+          const r = db.prepare(`SELECT count(*) as c FROM "${t}"`).get() as any;
+          counts[t] = r?.c ?? 0;
+        } catch {}
+      }
+      db.close();
+    } catch {}
+
+    const ai = await BrainFingerprint(tables, kb, apiKey, schemaContext, counts);
     
     if (ai.confidence >= 0.6) {
       const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
       const appKey = `auto_${ai.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`;
       if (!kb.lookup(fp)) {
+        const crypto = require("node:crypto");
+        const schemaHash = crypto.createHash("md5").update(tables.slice().sort().join(",")).digest("hex");
+
         kb.learn({
           appKey,
           appName: ai.appName,
           filePath: fp,
           method: "plain_sqlite",
           category: ai.category,
-          params: {},
-          schema: {},
+          params: { tableDescriptions: (ai as any).tableDescriptions, safeToRead: (ai as any).safeToRead, toolName: (ai as any).suggestedToolName },
+          schema: schemaContext,
           confidence: ai.confidence,
           totalRows: density.total,
-          maxRows: density.max
-        }, false);
+          maxRows: density.max,
+          source: "claude",
+          learnedAt: Date.now(),
+          schemaHash,
+          tableCount: tables.length,
+          rowCountSnapshot: density.total,
+          needsRecheck: false
+        }, true);
       }
       return { ...base, tables, appName: ai.appName, category: ai.category, confidence: ai.confidence, totalRows: density.total, maxRows: density.max };
     } else {
@@ -416,7 +454,7 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any): P
           method: "plain_sqlite",
           category: "other",
           params: {},
-          schema: {},
+          schema: schemaContext,
           confidence: ai.confidence,
           totalRows: density.total,
           maxRows: density.max
@@ -542,12 +580,82 @@ function buildConnector(scanned: ScannedFile): BaseConnector {
 export class SystemScanner {
   constructor(private readonly opts: SystemScannerOptions = {}) {}
 
+  private async processRecheckQueue(kb: any, apiKey: string) {
+    const queue = kb.getRecheckQueue().filter((q: any) => q.scheduledFor === "next_run");
+    if (queue.length === 0) return;
+
+    const { identifyWithClaude } = require("./brain.js");
+    queue.sort((a: any, b: any) => a.priority === "high" ? -1 : 1);
+    
+    for (const item of queue) {
+      if (this.opts.verbose) console.log(`[SCAN] Process recheck: ${item.path} (${item.reason})`);
+      kb.removeFromQueue(item.path);
+
+      if (!fs.existsSync(item.path)) continue;
+      const ft = fingerprint(item.path);
+      if (ft !== "sqlite") continue;
+
+      const tables = readTables(item.path);
+      const density = readDensity(item.path, tables);
+      const crypto = require("node:crypto");
+      const schemaHash = crypto.createHash('md5').update(tables.slice().sort().join(',')).digest('hex');
+
+      const schemaContext: Record<string, string[]> = {};
+      for (const t of tables.slice(0, 3)) {
+        schemaContext[t] = readColumns(item.path, [t]);
+      }
+      const counts: Record<string, number> = {};
+      try {
+        const DB = require("better-sqlite3");
+        const db = new DB(item.path, { readonly: true, timeout: 2000 });
+        for (const t of tables.slice(0, 10)) {
+          try {
+            const r = db.prepare(`SELECT count(*) as c FROM "${t}"`).get() as any;
+            counts[t] = r?.c ?? 0;
+          } catch {}
+        }
+        db.close();
+      } catch {}
+
+      const ai = await identifyWithClaude(schemaContext, counts, apiKey);
+      if (ai && ai.confidence >= 0.6) {
+        const existing = kb.lookup(item.path);
+        const slug = path.basename(item.path).toLowerCase().replace(/[^a-z0-9]/g,"_");
+        const appKey = existing ? existing.appKey : `ai_${ai.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`;
+
+        kb.learn({
+          appKey,
+          appName: ai.appName,
+          filePath: item.path,
+          method: "plain_sqlite",
+          category: ai.category,
+          params: { tableDescriptions: (ai as any).tableDescriptions, safeToRead: (ai as any).safeToRead, toolName: (ai as any).suggestedToolName },
+          schema: schemaContext,
+          confidence: ai.confidence,
+          totalRows: density.total,
+          maxRows: density.max,
+          source: "claude",
+          learnedAt: Date.now(),
+          schemaHash,
+          tableCount: tables.length,
+          rowCountSnapshot: density.total,
+          needsRecheck: false,
+          recheckReason: undefined
+        }, true);
+      }
+    }
+  }
+
   async run(): Promise<ScanResult> {
     const t0        = Date.now();
     const maxFiles  = this.opts.maxFiles ?? 5000;
     const maxDepth  = this.opts.maxDepth ?? 8;
     const threshold = this.opts.autoConnectThreshold ?? 0.80;
     const learned   = new KnowledgeBase();
+
+    if (this.opts.apiKey) {
+      await this.processRecheckQueue(learned, this.opts.apiKey);
+    }
 
     if (this.opts.verbose) {
       console.log("\n[SCAN] Starting full system scan");
@@ -575,9 +683,27 @@ export class SystemScanner {
       const analysed = await Promise.all(batch.map(async ({ fp, stat }) => {
         const ft = fingerprint(fp);
         if (ft === "unknown") return null;
-        // Check learned base first (instant)
         const known = (learned as any).lookup(fp);
         if (known) {
+          if (ft === "sqlite") {
+             const tables = readTables(fp);
+             const crypto = require("node:crypto");
+             const currentHash = crypto.createHash("md5").update(tables.slice().sort().join(",")).digest("hex");
+             const ageDays = (Date.now() - (known.learnedAt || known.solvedAt || 0)) / (1000 * 60 * 60 * 24);
+             let shouldQueue = false;
+             let reason = "";
+
+             if (known.schemaHash && currentHash !== known.schemaHash) {
+                 shouldQueue = true; reason = "schema_changed";
+             } else if (known.confidence < 0.8 && ageDays > 30) {
+                 shouldQueue = true; reason = "low_confidence_aged";
+             }
+
+             if (shouldQueue) {
+                 learned.queueRecheck({ path: fp, reason, priority: "high", scheduledFor: "next_run" });
+             }
+          }
+
           return {
             filePath: fp, fileType: ft, sizeBytes: stat.size, mtimeMs: stat.mtimeMs,
             appName: known.appName, category: known.category,
@@ -587,7 +713,7 @@ export class SystemScanner {
             maxRows: (known as any).maxRows ?? 0,
           } as ScannedFile;
         }
-        return (analyseFile as any)(fp, stat, ft, learned);
+        return analyseFile(fp, stat, ft, learned, this.opts.apiKey);
       }));
 
       for (const scanned of analysed) {
@@ -683,6 +809,9 @@ export class SystemScanner {
       { path: path.join(h, "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"), app: "Apple Calendar" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlite"), app: "Reminders" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlitedb"), app: "Reminders" },
+      { path: path.join(h, "Library/Group Containers/group.net.whatsapp.whatsapp.shared/ContactsV2.sqlite"), app: "WhatsApp" },
+      { path: path.join(h, "Library/Group Containers/group.net.whatsapp.whatsapp.shared/CallHistory.sqlite"), app: "WhatsApp" },
+      { path: path.join(h, "Library/Group Containers/group.net.whatsapp.whatsapp.shared/fts/ChatSearchV5f.sqlite"), app: "WhatsApp" },
       { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlite"), app: "Reminders" },
       { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlitedb"), app: "Reminders" },
       { path: path.join(h, "Library/Reminders/Reminders.sqlite"), app: "Reminders" },

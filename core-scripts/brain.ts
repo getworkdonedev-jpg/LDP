@@ -21,7 +21,7 @@ const require = createRequire(import.meta.url);
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 const APPROVALS_FILE = path.join(LDP_DIR, "approvals.json");
-const KNOWLEDGE_FILE = path.join(LDP_DIR, "brain_knowledge.json");
+const KNOWLEDGE_FILE = path.join(os.homedir(), "Desktop/LDP/core-scripts/brain_knowledge.json");
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type DataCategory =
@@ -53,6 +53,21 @@ export interface KnownSolution {
   solvedOnOS:   string;
   successCount: number;
   failureCount: number;
+  source?:           string;
+  learnedAt?:        number;
+  schemaHash?:       string;
+  tableCount?:       number;
+  rowCountSnapshot?: number;
+  appVersion?:       string;
+  needsRecheck?:     boolean;
+  recheckReason?:    string;
+}
+
+export interface RecheckQueueItem {
+  path:         string;
+  reason:       string;
+  priority:     "high" | "low";
+  scheduledFor: "next_run" | "now";
 }
 
 interface DecryptResult {
@@ -81,6 +96,7 @@ export interface StaticApp {
   requiresConsent: boolean;
   autoRegister:    boolean;
   params:          Record<string, unknown>;
+  schema?:         Record<string, string[]>;
 }
 
 export interface BrainDiagnosis {
@@ -95,6 +111,15 @@ export interface BrainDiagnosis {
 export interface BrainOptions {
   apiKey?:  string;
   verbose?: boolean;
+}
+
+export interface AppIdentity {
+  appName: string;
+  category: DataCategory;
+  confidence: number;
+  tableDescriptions: Record<string, string>;
+  safeToRead: boolean;
+  suggestedToolName: string;
 }
 
 // ── Category metadata ─────────────────────────────────────────────────────────
@@ -208,77 +233,112 @@ async function defaultCLIPrompt(msg: string): Promise<boolean> {
 // ── Knowledge Base ────────────────────────────────────────────────────────────
 export class KnowledgeBase {
   private store = new Map<string, KnownSolution>();
-  private readonly cry = getCrypto();
   private staticApps: StaticApp[] = [];
+  private recheckQueue: RecheckQueueItem[] = [];
 
   constructor() { this.load(); }
 
   private load() {
     try {
-      // 1. Initialise with static knowledge
-      this.loadStatic();
-
-      // 2. Load learned knowledge
-      const raw = this.cry.readEncrypted<Record<string, KnownSolution>>(KNOWLEDGE_FILE);
-      if (Object.keys(raw).length > 0) {
-        for (const [k, v] of Object.entries(raw)) this.store.set(k, v);
-      }
-    } catch {}
-  }
-
-  private loadStatic() {
-    try {
-      const staticFile = path.join(path.dirname(KNOWLEDGE_FILE).replace(".ldp", "LDP/core-scripts"), "brain_knowledge.json");
-      const fallbackFile = path.join(process.cwd(), "brain_knowledge.json");
-      const target = fs.existsSync(staticFile) ? staticFile : fallbackFile;
-      
-      if (fs.existsSync(target)) {
-        const raw = JSON.parse(fs.readFileSync(target, "utf-8"));
+      if (fs.existsSync(KNOWLEDGE_FILE)) {
+        const raw = JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf-8"));
+        
+        // Load static apps (the "base" knowledge)
         if (raw.apps) {
           this.staticApps = raw.apps;
           for (const app of this.staticApps) {
             const appKey = `static_${app.name.toLowerCase()}`;
             this.store.set(appKey, {
               appKey,
-              appName:      app.name,
-              filePath:     app.pathPattern,
-              method:       app.strategy,
-              category:     app.category,
-              params:       app.params,
-              schema:       {},
-              confidence:   1.0,
-              solvedAt:     0,
-              solvedOnOS:   "any",
-              successCount: 0,
-              failureCount: 0,
+              appName:    app.name,
+              filePath:   "static",
+              method:     "plain_sqlite",
+              category:   app.category as DataCategory,
+              params:     {},
+              schema:     app.schema || {},
+              confidence: 1.0,
+              solvedAt:   Date.now(),
+              solvedOnOS: process.platform,
+              successCount: 1,
+              failureCount: 0
             });
           }
         }
+
+        // Load learned knowledge
+        if (raw.learned) {
+          for (const [k, v] of Object.entries(raw.learned)) {
+            this.store.set(k, v as KnownSolution);
+          }
+        }
+
+        // Load recheck queue
+        if (raw.recheck_queue) {
+          this.recheckQueue = raw.recheck_queue;
+        }
       }
     } catch (e) {
-      console.warn("[BRAIN] Failed to load static knowledge:", e);
+      console.warn("[BRAIN] Failed to load knowledge:", e);
     }
   }
 
-  listStatic(): StaticApp[] { return this.staticApps; }
-
   public save() {
-    const obj: Record<string, KnownSolution> = {};
-    for (const [k, v] of this.store) obj[k] = v;
-    this.cry.writeEncrypted(KNOWLEDGE_FILE, obj);
+    try {
+      // Re-read file to keep existing static 'apps' but update 'learned'
+      let data: any = { version: "2.0", lastUpdated: new Date().toISOString(), apps: [], learned: {} };
+      if (fs.existsSync(KNOWLEDGE_FILE)) {
+        try { data = JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf-8")); } catch {}
+      }
+
+      const learned: Record<string, KnownSolution> = {};
+      
+      for (const [k, v] of this.store.entries()) {
+        if (!k.startsWith("static_")) learned[k] = v;
+      }
+
+      data.learned = learned;
+      data.recheck_queue = this.recheckQueue;
+      data.lastUpdated = new Date().toISOString();
+      
+      fs.mkdirSync(path.dirname(KNOWLEDGE_FILE), { recursive: true });
+      fs.writeFileSync(KNOWLEDGE_FILE, JSON.stringify(data, null, 2), "utf-8");
+    } catch (e) {
+      console.warn("[BRAIN] Failed to save knowledge:", e);
+    }
   }
 
-  learn(sol: Omit<KnownSolution, "solvedAt" | "solvedOnOS" | "successCount" | "failureCount">, autoSave = true) {
-    const ex = this.store.get(sol.appKey);
-    this.store.set(sol.appKey, {
-      ...sol,
-      solvedAt:     Date.now() / 1000,
-      solvedOnOS:   `${os.platform()} ${os.release()}`,
-      successCount: (ex?.successCount ?? 0) + 1,
-      failureCount: ex?.failureCount ?? 0,
-    });
+  learn(sol: Partial<KnownSolution> & { appKey: string }, autoSave = true) {
+    const full: KnownSolution = {
+      method: "unknown",
+      category: "other",
+      params: {},
+      schema: {},
+      confidence: 0,
+      solvedAt: Date.now(),
+      solvedOnOS: process.platform,
+      successCount: 1,
+      failureCount: 0,
+      filePath: "unknown",
+      appName: "unknown",
+      ...sol
+    };
+    this.store.set(full.appKey, full);
     if (autoSave) this.save();
-    console.log(`[BRAIN] Learned: ${sol.appName} → ${sol.method}`);
+    console.log(`[BRAIN] Learned: ${full.appName} → ${full.method} (Source: ${full.filePath === "ai_identified" || full.source === "claude" ? "CLAUDE" : "HEURISTIC"})`);
+  }
+
+  queueRecheck(item: RecheckQueueItem) {
+    if (!this.recheckQueue.some(x => x.path === item.path && x.reason === item.reason)) {
+      this.recheckQueue.push(item);
+      this.save();
+    }
+  }
+
+  getRecheckQueue(): RecheckQueueItem[] { return this.recheckQueue; }
+
+  removeFromQueue(path: string) {
+    this.recheckQueue = this.recheckQueue.filter(x => x.path !== path);
+    this.save();
   }
 
   recordFailure(appKey: string) {
@@ -327,7 +387,13 @@ const SCHEMA_SIGS: Array<{ cols: string[]; app: string; cat: DataCategory; conf:
   { cols:["ZREMCDREMINDER", "ZREMCDLIST", "ZREMCDACCOUNT"], app:"Apple Reminders", cat:"calendar", conf:0.98 },
 ];
 
-export function BrainFingerprint(tables: string[]): { appName: string; category: DataCategory; confidence: number } {
+export async function BrainFingerprint(
+  tables: string[], 
+  kb: KnowledgeBase,
+  apiKey?: string,
+  schemaContext?: Record<string, string[]>,
+  counts?: Record<string, number>
+): Promise<{ appName: string; category: DataCategory; confidence: number }> {
   if (!tables || tables.length === 0) return { appName: "unknown", category: "other", confidence: 0 };
   
   const all = [...tables].map(s => s.toLowerCase());
@@ -343,9 +409,85 @@ export function BrainFingerprint(tables: string[]): { appName: string; category:
     }
   }
   
-  // Rule 6: If we recognized it with >60% confidence, we ensure it's tracked in the static knowledge set 
-  // (In a fuller AI system, we'd actually prompt an LLM for unseen tables here)
+  // Rule 6: If confidence < 60% and we have an API key, ask Claude
+  if (bestMatch.conf < 0.60 && apiKey) {
+    try {
+      const ai = await identifyWithClaude(schemaContext || {}, counts || {}, apiKey);
+      if (ai && ai.confidence >= 0.60) {
+        // Learn it permanently so we never ask again for this schema
+        const appKey = `ai_${ai.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}`;
+        kb.learn({
+          appKey,
+          appName:    ai.appName,
+          filePath:   "ai_identified", // Mark as AI learned
+          method:     "plain_sqlite",
+          category:   ai.category,
+          params:     { tableDescriptions: ai.tableDescriptions, safeToRead: ai.safeToRead, toolName: ai.suggestedToolName },
+          schema:     schemaContext || {},
+          confidence: ai.confidence,
+        }, true);
+        
+        return { appName: ai.appName, category: ai.category, confidence: ai.confidence };
+      }
+    } catch (e) {
+      // AI identification failed, continue without it
+    }
+  }
+  
   return { appName: bestMatch.app, category: bestMatch.cat, confidence: bestMatch.conf };
+}
+
+export async function identifyWithClaude(schema: Record<string, string[]>, counts: Record<string, number>, apiKey: string): Promise<AppIdentity | null> {
+  console.log(`[CLAUDE_IDENTIFY] Calling Anthropic API for unknown schema...`);
+  const prompt = `I found a SQLite database with these tables and columns: ${JSON.stringify(schema)}
+Row counts: ${JSON.stringify(counts)}
+What application does this belong to?
+What does each table contain?
+Is this safe to read for a personal AI assistant?
+Reply in JSON:
+{
+  "appName": string,
+  "category": string,
+  "confidence": number,
+  "tableDescriptions": {"tableName": "description"},
+  "safeToRead": boolean,
+  "suggestedToolName": string
+}`;
+
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json", 
+        "x-api-key": apiKey, 
+        "anthropic-version": "2023-06-01" 
+      },
+      body: JSON.stringify({ 
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500, 
+        messages: [{ role: "user", content: prompt }] 
+      }),
+    });
+    
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.warn(`[CLAUDE_IDENTIFY] API Error (${resp.status}): ${errText}`);
+      return null;
+    }
+    const data = await resp.json() as any;
+    const text = data.content?.[0]?.text ?? "";
+    console.log(`[CLAUDE_IDENTIFY] Raw Response: ${text.slice(0, 300)}...`);
+
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn(`[CLAUDE_IDENTIFY] No JSON found in response.`);
+      return null;
+    }
+    return JSON.parse(jsonMatch[0]) as AppIdentity;
+  } catch (e) {
+    console.warn(`[CLAUDE_IDENTIFY] Fetch Exception: ${e}`);
+    return null;
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
