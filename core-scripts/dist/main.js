@@ -109,7 +109,7 @@ async function dashboard() {
         const __filename = fileURLToPath(import.meta.url);
         const __dirname = path.dirname(__filename);
         const scriptPath = path.join(__dirname, "..", "ldp_server.py");
-        const child = spawn("python3", [scriptPath], { detached: true, stdio: 'ignore' });
+        const child = spawn("python3", [scriptPath, "--dashboard"], { detached: true, stdio: 'ignore' });
         child.unref();
         // wait a moment for it to write the port file
         await new Promise(r => setTimeout(r, 1000));

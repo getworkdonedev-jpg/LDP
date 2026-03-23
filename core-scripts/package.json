@@ -45,7 +45,7 @@
     }
   },
   "bin": {
-    "ldp": "./dist/esm/cli/main.js"
+    "ldp": "./dist/main.js"
   },
   "files": [
     "dist",

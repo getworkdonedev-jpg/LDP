@@ -90,6 +90,7 @@ export type BrainErrorType =
 
 export interface StaticApp {
   name:            string;
+  appName?:        string;   // alias used by train_brain output
   pathPattern:     string;
   category:        DataCategory;
   strategy:        DecryptMethod;
@@ -120,6 +121,9 @@ export interface AppIdentity {
   tableDescriptions: Record<string, string>;
   safeToRead: boolean;
   suggestedToolName: string;
+  source?: string;
+  description?: string;
+  needsRecheck?: boolean;
 }
 
 // ── Category metadata ─────────────────────────────────────────────────────────
@@ -243,14 +247,16 @@ export class KnowledgeBase {
       if (fs.existsSync(KNOWLEDGE_FILE)) {
         const raw = JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, "utf-8"));
         
-        // Load static apps (the "base" knowledge)
+        // Load static apps (the "base" knowledge) — support both app.name (old) and app.appName (new)
         if (raw.apps) {
           this.staticApps = raw.apps;
           for (const app of this.staticApps) {
-            const appKey = `static_${app.name.toLowerCase()}`;
+            const name = app.appName || app.name;
+            if (!name) continue;
+            const appKey = `static_${name.toLowerCase()}`;
             this.store.set(appKey, {
               appKey,
-              appName:    app.name,
+              appName:    name,
               filePath:   "static",
               method:     "plain_sqlite",
               category:   app.category as DataCategory,
@@ -409,32 +415,228 @@ export async function BrainFingerprint(
     }
   }
   
-  // Rule 6: If confidence < 60% and we have an API key, ask Claude
-  if (bestMatch.conf < 0.60 && apiKey) {
+  // Rule 6: If confidence < 80%, ask Teachers
+  if (bestMatch.conf < 0.80) {
     try {
-      const ai = await identifyWithClaude(schemaContext || {}, counts || {}, apiKey);
+      const ai = await identifyWithTeachers(schemaContext || {}, counts || {}, "unknown.sqlite");
       if (ai && ai.confidence >= 0.60) {
-        // Learn it permanently so we never ask again for this schema
         const appKey = `ai_${ai.appName.toLowerCase().replace(/[^a-z0-9]/g,"_")}`;
         kb.learn({
           appKey,
           appName:    ai.appName,
-          filePath:   "ai_identified", // Mark as AI learned
+          filePath:   "ai_identified",
           method:     "plain_sqlite",
-          category:   ai.category,
-          params:     { tableDescriptions: ai.tableDescriptions, safeToRead: ai.safeToRead, toolName: ai.suggestedToolName },
+          category:   ai.category || "other",
+          params:     { safeToRead: (ai as any).safeToRead, description: (ai as any).description },
           schema:     schemaContext || {},
           confidence: ai.confidence,
+          source:     ai.source
         }, true);
         
-        return { appName: ai.appName, category: ai.category, confidence: ai.confidence };
+        return { appName: ai.appName, category: ai.category || "other", confidence: ai.confidence };
       }
     } catch (e) {
-      // AI identification failed, continue without it
+      // AI identification failed
     }
   }
   
   return { appName: bestMatch.app, category: bestMatch.cat, confidence: bestMatch.conf };
+}
+
+// ── Preloaded app signatures (for instant cache lookup) ──────────────────────
+const PRELOADED_APPS = [
+  { appName: "iMessage",        category: "messaging" as DataCategory, tableSignature: ["message","chat","handle","attachment"],   pathPatterns: ["**/Messages/chat.db"] },
+  { appName: "Apple Notes",     category: "notes"     as DataCategory, tableSignature: ["ZNOTE","ZNOTEBODY","ZACCOUNT"],             pathPatterns: ["**/group.com.apple.notes/NoteStore.sqlite"] },
+  { appName: "WhatsApp",        category: "messaging" as DataCategory, tableSignature: ["ZWAMESSAGE","ZWAADDRESSBOOKCONTACT"],       pathPatterns: ["**/group.net.whatsapp.whatsapp.shared/**"] },
+  { appName: "Signal",          category: "messaging" as DataCategory, tableSignature: ["messages","conversations","contacts"],     pathPatterns: ["**/Signal/sql/db.sqlite"] },
+  { appName: "Apple Calendar",  category: "calendar"  as DataCategory, tableSignature: ["ZCALENDARITEM","ZCALENDAR","ZPARTICIPANT"], pathPatterns: ["**/Calendars/**/*.sqlite"] },
+  { appName: "Apple Contacts",  category: "contacts"  as DataCategory, tableSignature: ["ZABCDRECORD","ZABCDEMAILADDRESS","ZABCDPHONENUMBER"], pathPatterns: ["**/AddressBook/**/*.abcddb"] },
+  { appName: "Apple Reminders", category: "calendar"  as DataCategory, tableSignature: ["ZREMCDREMINDER","ZREMCDOBJECT"],           pathPatterns: ["**/group.com.apple.reminders/**/*.sqlite"] },
+  { appName: "Safari",          category: "browser"   as DataCategory, tableSignature: ["history_items","history_visits"],          pathPatterns: ["**/Safari/History.db"] },
+  { appName: "Google Chrome",   category: "browser"   as DataCategory, tableSignature: ["urls","visits","keyword_search_terms"],    pathPatterns: ["**/Chrome/*/History"] },
+  { appName: "Spotify",         category: "media"     as DataCategory, tableSignature: ["track_cache","playlist_cache","play_history"], pathPatterns: ["**/Spotify/*.db"] },
+  { appName: "Apple Podcasts",  category: "media"     as DataCategory, tableSignature: ["ZMTEPISODE","ZMTCHANNEL","ZMTCATEGORY"],   pathPatterns: ["**/group.com.apple.podcasts/**/*.sqlite"] },
+  { appName: "Telegram",        category: "messaging" as DataCategory, tableSignature: ["TMessage","TConversation","TUser"],         pathPatterns: ["**/group.net.telegram.TelegramShared/**"] },
+  { appName: "Discord",         category: "messaging" as DataCategory, tableSignature: [],                                           pathPatterns: ["**/discord/**/*.db"] },
+  { appName: "Apple Mail",      category: "other"     as DataCategory, tableSignature: [],                                           pathPatterns: ["**/Mail/**/*.emlx"] },
+  { appName: "FaceTime",        category: "messaging" as DataCategory, tableSignature: ["ZCALLRECORD","ZPARTICIPANT"],               pathPatterns: ["**/Application Support/FaceTime/**/*.db"] },
+  { appName: "Apple Maps",      category: "other"     as DataCategory, tableSignature: ["history","search","favorite"],             pathPatterns: ["**/Application Support/Maps/**/*.db"] },
+  { appName: "Apple Journal",   category: "notes"     as DataCategory, tableSignature: [],                                           pathPatterns: ["**/group.com.apple.journal/**/*.sqlite"] },
+];
+
+function buildPrompt(schema: any): string {
+  return `Identify this SQLite database.
+Tables: ${schema.tables ? schema.tables.join(", ") : ""}
+Sample columns: ${Object.values(schema.columns || {}).flat().slice(0, 10).join(", ")}
+Row counts: ${JSON.stringify(schema.rowCounts || {})}
+
+Reply in JSON only:
+{
+  "appName": "exact app name",
+  "confidence": 0.0,
+  "category": "communication",
+  "safeToRead": true,
+  "description": "what this stores"
+}`;
+}
+
+function parseIdentity(text: string): AppIdentity | null {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) {
+    console.warn("[TEACHER] No JSON found in AI response.");
+    return null;
+  }
+  try {
+    return JSON.parse(match[0]) as AppIdentity;
+  } catch (e) {
+    console.warn("[TEACHER] Failed to parse AI response JSON:", e);
+    return null;
+  }
+}
+
+async function detectProvider(provider: "ollama" | "groq" | "gemini" | "claude"): Promise<boolean> {
+  switch (provider) {
+    case "ollama":
+      try {
+        const fetch = (await import("node-fetch")).default;
+        const res = await fetch("http://localhost:11434/api/tags");
+        return res.ok;
+      } catch { return false; }
+    case "groq":
+      return !!process.env.GROQ_API_KEY;
+    case "gemini":
+      return !!process.env.GEMINI_API_KEY;
+    case "claude":
+      return !!process.env.ANTHROPIC_API_KEY;
+    default:
+      return false;
+  }
+}
+
+async function askAI(
+  provider: "ollama" | "groq" | "gemini" | "claude",
+  schema: any,
+  apiKey?: string,
+  baseUrl?: string,
+  model?: string
+): Promise<AppIdentity | null> {
+  const fetch = (await import("node-fetch")).default;
+  const prompt = buildPrompt(schema);
+
+  try {
+    let response;
+    if (provider === "gemini") {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 300 }
+        })
+      });
+    } else if (provider === "claude") {
+      response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey!,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: model || "claude-3-5-sonnet-20240620",
+          max_tokens: 300,
+          messages: [{ role: "user", content: prompt }]
+        }),
+      });
+    } else { // Groq, Ollama (OpenAI-compatible API)
+      response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 300,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+    }
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.warn(`[TEACHER] API Error (${provider} - ${response.status}): ${errText}`);
+      return null;
+    }
+
+    const data = await response.json() as any;
+    let text: string;
+
+    if (provider === "gemini") {
+      text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    } else if (provider === "claude") {
+      text = data.content?.[0]?.text ?? "";
+    } else { // Groq, Ollama
+      text = data.choices?.[0]?.message?.content ?? "";
+    }
+
+    return parseIdentity(text);
+  } catch (e) {
+    console.warn(`[TEACHER] ${provider} failed:`, e);
+    return null;
+  }
+}
+
+export async function identifyWithTeachers(schemaContext: any, counts: any, filePath: string): Promise<AppIdentity | null> {
+  const schema = { tables: Object.keys(schemaContext), columns: schemaContext, rowCounts: counts };
+
+  // Level 1: Groq
+  if (await detectProvider("groq")) {
+    try {
+      console.log("[TEACHER] Asking Groq...");
+      const result = await askAI("groq", schema, process.env.GROQ_API_KEY, "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile");
+      if (result && result.confidence > 0.7) return { ...result, source: "groq" };
+    } catch (e) { console.log("[TEACHER] Groq failed", e); }
+  }
+
+  // Level 2: Gemini
+  if (await detectProvider("gemini")) {
+    try {
+      console.log("[TEACHER] Asking Gemini...");
+      const result = await askAI("gemini", schema, process.env.GEMINI_API_KEY, undefined, "gemini-2.0-flash-lite");
+      if (result && result.confidence > 0.7) return { ...result, source: "gemini" };
+    } catch (e) { console.log("[TEACHER] Gemini failed", e); }
+  }
+
+  // Level 3: Ollama
+  if (await detectProvider("ollama")) {
+    try {
+      console.log("[TEACHER] Asking local Ollama...");
+      const result = await askAI("ollama", schema, "ollama", "http://localhost:11434/v1", "llama3.1");
+      if (result && result.confidence > 0.6) return { ...result, source: "ollama" };
+    } catch (e) { console.log("[TEACHER] Ollama failed", e); }
+  }
+
+  // Level 4: Claude
+  if (await detectProvider("claude")) {
+    try {
+      console.log("[TEACHER] Asking Claude...");
+      const result = await askAI("claude", schema, process.env.ANTHROPIC_API_KEY, undefined, "claude-3-5-sonnet-20241022");
+      if (result && result.confidence > 0.4) return { ...result, source: "claude" };
+    } catch (e) { console.log("[TEACHER] Claude failed", e); }
+  }
+
+  // Step 6: Register as unknown, schedule recheck
+  return {
+    appName: "unknown_" + path.basename(filePath).replace(/[^a-zA-Z0-9]/g, "_"),
+    confidence: 0,
+    category: "other" as DataCategory,
+    tableDescriptions: {},
+    safeToRead: false,
+    suggestedToolName: "",
+    needsRecheck: true,
+    source: "none"
+  } as AppIdentity;
 }
 
 export async function identifyWithClaude(schema: Record<string, string[]>, counts: Record<string, number>, apiKey: string): Promise<AppIdentity | null> {

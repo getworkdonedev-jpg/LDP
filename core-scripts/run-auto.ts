@@ -5,7 +5,11 @@ async function main() {
   console.log("\n[LDP] Starting AI-Powered Auto-Discovery (Phase 14)...");
   console.log("====================================================\n");
 
-  const scanner = new SystemScanner({ verbose: true, maxFiles: 5000 });
+  const scanner = new SystemScanner({ 
+    verbose: true, 
+    maxFiles: 5000,
+    apiKey: process.env.ANTHROPIC_API_KEY 
+  });
   const result = await scanner.run();
 
   console.log("\n[LDP] SCAN SUMMARY:");

@@ -646,6 +646,73 @@ WALK_SKIP_PATTERNS = [
     ".macromedia", "Cookies", "CoreDataBackend", "TipKit", "Dock", "DriveFS"
 ]
 
+def tool_whatsapp_query(args: dict) -> str:
+    """Specialized handler for WhatsApp local data (readable only)."""
+    wa_base1 = HOME / "Library/Group Containers/group.net.whatsapp.whatsapp.shared"
+    wa_base2 = HOME / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+    
+    candidates = [
+        wa_base2 / "ChatStorage.sqlite",
+        wa_base1 / "CallHistory.sqlite",
+        wa_base1 / "ContactsV2.sqlite",
+        wa_base1 / "fts/ChatSearchV5f.sqlite"
+    ]
+    
+    exists = [fp for fp in candidates if fp.exists()]
+    if not exists: return "WhatsApp databases not found."
+
+    query = args.get("query", "")
+    limit = args.get("limit", 10)
+    
+    if query:
+        for fp in exists:
+            data = read_sqlite(fp, query)
+            if data is not None:
+                return f"WhatsApp Data ({fp.name}):\n" + json.dumps(data[:limit], indent=2)
+        return "Query failed on all WhatsApp databases. Check table names or SQL syntax."
+        
+    results = []
+    for fp in exists:
+        try:
+            tables = read_sqlite(fp, "SELECT name FROM sqlite_master WHERE type='table'")
+            if not tables: continue
+            best_table = None
+            max_r = 0
+            for t in [d['name'] for d in tables]:
+                rc = read_sqlite(fp, f"SELECT count(*) as c FROM \"{t}\"")
+                if rc and rc[0]['c'] > max_r:
+                    max_r = rc[0]['c']
+                    best_table = t
+            
+            if best_table:
+                data = read_sqlite(fp, f"SELECT * FROM \"{best_table}\" LIMIT {limit}")
+                results.append({ "file": fp.name, "rows": max_r, "sample": data })
+        except: continue
+        
+    if not results: return "No readable WhatsApp databases found (or zero rows)."
+    
+    # Return result with most rows
+    results.sort(key=lambda x: x['rows'], reverse=True)
+    best = results[0]
+    return f"WhatsApp Data ({best['file']}, {best['rows']} rows):\n" + json.dumps(best['sample'], indent=2)
+
+def tool_signal_query(args: dict) -> str:
+    """Signal database handler (Encrypted - requires consent gate)."""
+    return "Signal database is protected by LDP Consent Gate. Decryption requires Signal passkey from local Keychain. Please use the LDP Dashboard to approve and unlock Signal data."
+
+def tool_telegram_query(args: dict) -> str:
+    """Telegram database handler."""
+    tg_base = HOME / "Library/Group Containers"
+    # Find any telegram-related container with a postbox db
+    db_paths = list(tg_base.glob("*.org.telegram.Telegram-iOS/postbox/db/db_sqlite"))
+    if not db_paths: return "Telegram database not found on this system."
+    
+    try:
+        data = read_sqlite(db_paths[0], "SELECT * FROM sqlite_master WHERE type='table' LIMIT 20")
+        return f"Telegram Schema Info (Found {len(data)} tables):\n" + json.dumps(data, indent=2)
+    except Exception as e:
+        return f"Error reading Telegram DB: {e}"
+
 import zipfile
 
 def check_for_new_exports():
@@ -984,6 +1051,9 @@ TOOL_MAP = {
     "ldp_query_app": lambda a: tool_query_app(a.get("app_name",""), a.get("query","")),
     "ldp_discover_apps": lambda a: tool_discover_apps(),
     "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
+    "ldp_whatsapp_query": lambda a: tool_whatsapp_query(a),
+    "ldp_signal_query": lambda a: tool_signal_query(a),
+    "ldp_telegram_query": lambda a: tool_telegram_query(a),
 }
 
 import threading

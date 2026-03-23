@@ -82,7 +82,10 @@ export class LDPCrypto {
     writeEncrypted(filePath, obj) {
         const dir = path.dirname(filePath);
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-        fs.writeFileSync(filePath, this.encryptJson(obj), { mode: 0o600 });
+        const tmpPath = `${filePath}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+        const data = this.encryptJson(obj);
+        fs.writeFileSync(tmpPath, data, { mode: 0o600 });
+        fs.renameSync(tmpPath, filePath);
     }
     readEncrypted(filePath) {
         if (!fs.existsSync(filePath))

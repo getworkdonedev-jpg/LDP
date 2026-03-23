@@ -132,7 +132,11 @@ const SKIP_PATH_PATTERNS = [
   "/.Spotlight-","/CoreData/","metadata.sqlite","CloudKitLocalStore",
   "tomb","backup","cache","thumbnail","authorization",
   "akd","siri_inference","heavy_ad","tipkit","dock_desktop",
-  "drivefs", "DriveFS"
+  "drivefs", "DriveFS",
+  // Speed-up: skip app bundle internals & browser component packs
+  "Contents/Resources", "verified_contents.json", "WidevineCdm",
+  "SolutionPackages", "ActorSafetyLists", "MC_43.10.2.11",
+  ".app/Contents/", "plugin_config", "modules/discord_",
 ];
 
 const DATA_EXTS = new Set([
@@ -269,7 +273,7 @@ function identifyFromPath(fp: string) {
   return null;
 }
 
-function readTables(fp: string): string[] {
+export function readTables(fp: string): string[] {
   try {
     const DB = require("better-sqlite3");
     const db = new DB(fp, { readonly: true, timeout: 2000 });
@@ -279,7 +283,7 @@ function readTables(fp: string): string[] {
   } catch { return []; }
 }
 
-function readDensity(fp: string, tables: string[]): { total: number, max: number } {
+export function readDensity(fp: string, tables: string[]): { total: number, max: number } {
   if (tables.length === 0) return { total: 0, max: 0 };
   let total = 0;
   let max = 0;
@@ -373,6 +377,13 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, ap
   if (pm) {
     const res = { ...base, appName: pm.app, category: pm.cat, confidence: pm.conf, tables, totalRows: density.total, maxRows: density.max };
     const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+    
+    let schemaHash: string | undefined = undefined;
+    if (ft === "sqlite" || ft === "sqlcipher") {
+        const crypto = require("node:crypto");
+        schemaHash = crypto.createHash("md5").update(tables.slice().sort().join(",")).digest("hex");
+    }
+
     kb.learn({ 
       appKey: `path_${pm.app.toLowerCase().replace(/[^a-z0-9]/g,"_")}_${slug}`, 
       appName: pm.app, 
@@ -383,7 +394,13 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, ap
       schema: {}, 
       confidence: pm.conf,
       totalRows: density.total,
-      maxRows: density.max
+      maxRows: density.max,
+      source: "heuristic",
+      learnedAt: Date.now(),
+      schemaHash,
+      tableCount: tables.length,
+      rowCountSnapshot: density.total,
+      needsRecheck: false
     }, false);
     return res;
   }
@@ -584,7 +601,7 @@ export class SystemScanner {
     const queue = kb.getRecheckQueue().filter((q: any) => q.scheduledFor === "next_run");
     if (queue.length === 0) return;
 
-    const { identifyWithClaude } = require("./brain.js");
+    const { identifyWithTeachers } = require("./brain.js");
     queue.sort((a: any, b: any) => a.priority === "high" ? -1 : 1);
     
     for (const item of queue) {
@@ -617,7 +634,7 @@ export class SystemScanner {
         db.close();
       } catch {}
 
-      const ai = await identifyWithClaude(schemaContext, counts, apiKey);
+      const ai = await identifyWithTeachers(schemaContext, counts, item.path);
       if (ai && ai.confidence >= 0.6) {
         const existing = kb.lookup(item.path);
         const slug = path.basename(item.path).toLowerCase().replace(/[^a-z0-9]/g,"_");
@@ -634,7 +651,7 @@ export class SystemScanner {
           confidence: ai.confidence,
           totalRows: density.total,
           maxRows: density.max,
-          source: "claude",
+          source: (ai as any).source || "teacher_cascade",
           learnedAt: Date.now(),
           schemaHash,
           tableCount: tables.length,
@@ -693,7 +710,15 @@ export class SystemScanner {
              let shouldQueue = false;
              let reason = "";
 
-             if (known.schemaHash && currentHash !== known.schemaHash) {
+             if (!known.schemaHash) {
+                 known.schemaHash = currentHash;
+                 known.tableCount = tables.length;
+                 known.learnedAt = known.solvedAt || Date.now();
+                 known.needsRecheck = false;
+                 learned.save();
+             }
+
+             if (currentHash !== known.schemaHash) {
                  shouldQueue = true; reason = "schema_changed";
              } else if (known.confidence < 0.8 && ageDays > 30) {
                  shouldQueue = true; reason = "low_confidence_aged";
