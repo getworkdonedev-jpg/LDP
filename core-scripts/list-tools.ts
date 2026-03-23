@@ -31,11 +31,15 @@ async function main() {
     let name = rawName;
     
     // Grouping / Deduping
-    if (name.includes("_state_vscdb") || name.includes("vscode")) name = "vscode";
+    if (name.includes("vscode")) name = "vscode";
     if (name.includes("whatsapp")) name = "whatsapp";
-    if (name.includes("chrome") || (sol.appName.toLowerCase().includes("chrome") && name.includes("history"))) name = "chrome";
-    if (name.includes("history") && !name.includes("chrome")) name = "shell";
-    if (name.includes("git")) name = "git";
+    if (name.includes("chrome")) name = "chrome";
+    if (name.includes("safari")) name = "safari";
+    if (name.includes("zsh_history") || name.includes("bash_history") || (name.includes("history") && !name.includes("chrome") && !name.includes("safari"))) name = "shell";
+    if (name.includes("git") || sol.appName.toLowerCase().includes("git")) name = "git";
+    if (name.includes("calendar")) name = "calendar";
+    if (name.includes("contacts")) name = "contacts";
+    if (name.includes("reminders")) name = "reminders";
 
     // Clean up names
     name = name.replace(/^static_|^path_|^auto_/, "");
