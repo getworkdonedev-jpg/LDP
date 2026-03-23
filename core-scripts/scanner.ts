@@ -682,8 +682,11 @@ export class SystemScanner {
       { path: "/Users/karthikperumalla/Desktop/LDP/.git", app: "Git Log" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"), app: "Apple Calendar" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlite"), app: "Reminders" },
+      { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlitedb"), app: "Reminders" },
       { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlite"), app: "Reminders" },
-      { path: path.join(h, "Library/Reminders/Reminders.sqlite"), app: "Reminders" }
+      { path: path.join(h, "Library/Reminders/Container_v1/Reminders.sqlitedb"), app: "Reminders" },
+      { path: path.join(h, "Library/Reminders/Reminders.sqlite"), app: "Reminders" },
+      { path: path.join(h, "Library/Reminders/Reminders.sqlitedb"), app: "Reminders" }
     ];
 
     for (const p of probes) {
