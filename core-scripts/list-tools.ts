@@ -34,8 +34,8 @@ async function main() {
     if (name.includes("_state_vscdb") || name.includes("vscode")) name = "vscode";
     if (name.includes("whatsapp")) name = "whatsapp";
     if (name.includes("chrome") || (sol.appName.toLowerCase().includes("chrome") && name.includes("history"))) name = "chrome";
-    if (name.includes("zsh_history") || sol.appName.toLowerCase().includes("shell")) name = "shell";
-    if (name.includes(".git") || sol.appName.toLowerCase().includes("git")) name = "git";
+    if (name.includes("history") && !name.includes("chrome")) name = "shell";
+    if (name.includes("git")) name = "git";
 
     // Clean up names
     name = name.replace(/^static_|^path_|^auto_/, "");
