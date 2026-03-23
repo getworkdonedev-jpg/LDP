@@ -1280,7 +1280,11 @@ class ScreenWatcher:
 
         # Rule 3: ask teacher cascade
         if bundle_id:
-            prompt = f"What macOS app has bundle ID {bundle_id}? Reply with just the app name."
+            prompt = (f"I am running a macOS app with bundle identifier '{bundle_id}'. "
+                      f"What is the exact marketing name of this application? "
+                      f"Consider that com.github.Electron is used by Cursor (not VS Code). "
+                      f"VS Code uses com.microsoft.VSCode. Reply with ONLY the app name, "
+                      f"nothing else. No explanation.")
             answer = self._ask_teachers(prompt)
             if answer:
                 self._save_bundle_id(bundle_id, answer)
