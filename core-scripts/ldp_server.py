@@ -8,6 +8,7 @@ Reads: Chrome history, shell history, VS Code recent files,
 import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform, glob
 from pathlib import Path
 from datetime import datetime, timezone
+import typing
 from typing import List, Optional, Union, Dict, Any
 
 # ── Common Paths & Global State ───────────────────────────────────
@@ -99,9 +100,76 @@ class LDPSecurityEnforcer:
 
 security_enforcer = LDPSecurityEnforcer()
 
-# PLATFORM_PATHS removed in Phase 14 to allow for true auto-discovery.
-# All data locations are now managed by brain_knowledge.json.
-DYNAMIC_PATHS = {} # tool_name -> file_path
+PLATFORM = platform.system()
+DISCOVERED_APPS = {}
+SOURCES = {} # Legacy fallback for query_app
+PLATFORM_PATHS = {} # Legacy fallback for permissions check
+LDP_START_TIME = datetime.now(timezone.utc).timestamp()
+
+def log_ldp_crash(msg: str):
+    """Log crashes to disk and logging system."""
+    logging.error(f"CRASH | {msg}")
+    try:
+        crash_log = HOME / ".ldp" / "crash.log"
+        crash_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(crash_log, "a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} | {msg}\n")
+    except: pass
+
+def find_mail_db() -> Optional[Path]:
+    """Helper to locate the local Apple Mail Envelope Index."""
+    p = HOME / "Library/Mail/V10/MailData/Envelope Index"
+    return p if p.exists() else None
+
+def tool_system_health(args: Optional[Dict[str, Any]] = None) -> str:
+    """Check LDP health, logs, and recent crashes."""
+    out = [f"LDP System Health (Uptime: {int(datetime.now(timezone.utc).timestamp() - LDP_START_TIME)}s)"]
+    
+    # 1. Syslog last 10 lines
+    out.append("\\n--- Last 10 System Log Lines ---")
+    syslog_path = Path("/var/log/system.log")
+    if syslog_path.exists():
+        try:
+            with open(syslog_path, "r", errors="ignore") as f:
+                lines = f.read().splitlines()
+                out.extend(lines[-10:])
+        except: pass
+        
+    # 2. Crash logs from today
+    out.append("\\n--- Crash Logs (Today) ---")
+    diag_dir = HOME / "Library/Logs/DiagnosticReports"
+    crashes_found = []
+    if diag_dir.exists():
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for log in diag_dir.glob("*.ips"):
+            if today_str in log.name or today_str in datetime.fromtimestamp(log.stat().st_mtime).strftime("%Y-%m-%d"):
+                crashes_found.append(log.name)
+    if crashes_found:
+        out.extend(crashes_found)
+    else:
+        out.append("No crashes found today.")
+        
+    # 3. Disk space status
+    out.append("\\n--- Disk Space ---")
+    try:
+        disk_cmd = subprocess.run(["df", "-h", "/"], capture_output=True, text=True)
+        if disk_cmd.returncode == 0:
+            out.append(disk_cmd.stdout.strip().split("\\n")[-1])
+    except: pass
+    
+    # 4. Memory pressure
+    out.append("\\n--- Memory Settings ---")
+    try:
+        mem_cmd = subprocess.run(["vm_stat"], capture_output=True, text=True)
+        if mem_cmd.returncode == 0:
+            out.extend(mem_cmd.stdout.strip().split("\\n")[:5])
+    except: pass
+    
+    return "\\n".join(out)
+
+DYNAMIC_PATHS: Dict[str, str] = {} # tool_name -> file_path
+DISCOVERED_APPS: Dict[str, Any] = {}
+DISCOVERED_EXPORTS: Dict[str, Any] = {}
 
 # ── Approval Management ──────────────────────────────────────────
 
@@ -314,9 +382,11 @@ def tool_chrome_history(limit: int = 30) -> str:
     if not all_rows: return "No history entries found."
     all_rows.sort(key=lambda x: x.get("visit_count", 0), reverse=True)
     
-    out = [f"{'URL':<60} {'VISITS':>6}"]
-    for r in all_rows[:limit]:
-        url_str = str(r.get("url", ""))[:58]
+    out: List[str] = [f"{'URL':<60} {'VISITS':>6}"]
+    r_slice = typing.cast(Any, all_rows)[:limit]
+    for r in r_slice:
+        url_raw = str(r.get("url", ""))
+        url_str = typing.cast(Any, url_raw)[:58]
         visits  = int(r.get("visit_count", 0))
         out.append(f"{url_str:<60} {visits:>6}")
     return "\n".join(out)
@@ -385,6 +455,7 @@ def tool_imessage_history(limit: int = 50, query: str = "") -> str:
     finally:
         try: os.unlink(tmp_path)
         except: pass
+    return ""
 
 def tool_contacts_history(query: str = "") -> str:
     """Search Apple Contacts."""
@@ -429,7 +500,8 @@ def tool_contacts_history(query: str = "") -> str:
             
     if not results: return "No contacts found."
     # Deduplicate and sort
-    return "Contacts:\n" + "\n".join(sorted(list(set(results)))[:50])
+    s_results = sorted(list(set(results)))
+    return "Contacts:\n" + "\n".join(typing.cast(Any, s_results)[:50])
 
 def tool_calendar_history(limit: int = 50) -> str:
     """Read recent/upcoming Apple Calendar events."""
@@ -470,6 +542,7 @@ def tool_calendar_history(limit: int = 50) -> str:
     finally:
         try: os.unlink(tmp_path)
         except: pass
+    return ""
 
 def tool_claude_history(limit: int = 20, query: str = "") -> str:
     """Read Claude Desktop local session history and MCP config."""
@@ -536,7 +609,8 @@ def tool_claude_history(limit: int = 20, query: str = "") -> str:
     
     if not results: return "No Claude session data found."
     out = [f"Claude Desktop Data ({len(results)} items found):\n"]
-    for r in results[:limit]:
+    r_slice = typing.cast(Any, results)[:limit]
+    for r in r_slice:
         rtype = r.get("type", "unknown")
         out.append(f"  [{rtype}] {r}")
     return "\n".join(out)
@@ -556,7 +630,7 @@ def tool_manage_approvals(action: str, category: str = "") -> str:
         # Live unregister dynamic tools
         for name_key in list(DISCOVERED_APPS.keys()):
             if classify_app(name_key) == category:
-                del DISCOVERED_APPS[name_key]
+                DISCOVERED_APPS.pop(name_key, None)
                 
         # Rebuild TOOLS list excluding the revoked category
         tools_to_keep = []
@@ -576,7 +650,8 @@ def tool_manage_approvals(action: str, category: str = "") -> str:
             tools_to_keep.append(t)
             
         removed_count = len(TOOLS) - len(tools_to_keep)
-        TOOLS[:] = tools_to_keep # in-place modification
+        TOOLS.clear()
+        TOOLS.extend(tools_to_keep)
         return f"Revoked '{category}'. {removed_count} tools instantly unregistered."
         
     elif action == "reapprove":
@@ -596,7 +671,7 @@ def count_db_rows(db_path: Path) -> int:
     """Count total rows across all tables in a SQLite db using a temp copy."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
-    total = 0
+    total: int = 0
     try:
         shutil.copy2(str(db_path), tmp.name)
         con = sqlite3.connect(tmp.name)
@@ -604,7 +679,9 @@ def count_db_rows(db_path: Path) -> int:
         for tbl in tables:
             try:
                 row = con.execute(f"SELECT count(*) FROM \"{tbl}\"").fetchone()
-                if row: total += row[0]
+                if row and row[0] is not None:
+                    # Force Pyre to ignore the accumulating type bug natively
+                    total = typing.cast(Any, total) + typing.cast(Any, row[0])
             except: pass
         con.close()
     except: pass
@@ -617,7 +694,7 @@ def max_table_rows(db_path: Path) -> tuple:
     """Return (max_rows, table_count) from the db (temp-copy safe)."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
-    max_rows = 0
+    max_rows: int = 0
     table_count = 0
     try:
         shutil.copy2(str(db_path), tmp.name)
@@ -668,7 +745,8 @@ def tool_whatsapp_query(args: dict) -> str:
         for fp in exists:
             data = read_sqlite(fp, query)
             if data is not None:
-                return f"WhatsApp Data ({fp.name}):\n" + json.dumps(data[:limit], indent=2)
+                d_slice = typing.cast(Any, data)[:limit]
+                return f"WhatsApp Data ({fp.name}):\n" + json.dumps(d_slice, indent=2)
         return "Query failed on all WhatsApp databases. Check table names or SQL syntax."
         
     results = []
@@ -723,7 +801,7 @@ def check_for_new_exports():
     
     if not downloads.exists(): return
     
-    PATTERNS = {
+    PATTERNS: Dict[str, str] = {
         "claude": "personal",
         "instagram": "personal",
         "takeout": "communication",
@@ -733,14 +811,14 @@ def check_for_new_exports():
     # Check / Extract loop
     for path in downloads.glob("*.zip"):
         name = path.stem.lower()
-        matched = None
+        matched: str = ""
         for prefix in PATTERNS.keys():
             if name.startswith(prefix):
-                matched = prefix
+                matched = str(prefix)
                 break
                 
         if not matched: continue
-        category = PATTERNS[matched]
+        category = str(PATTERNS.get(matched, "unknown"))
         
         target_dir = exports_dir / name
         if not target_dir.exists():
@@ -757,7 +835,10 @@ def check_for_new_exports():
         
         # Make the generic query lambda for the master tooling map
         tool_name = f"ldp_export_{name.replace('-','_')}_query"
-        TOOL_MAP[tool_name] = lambda a, t=target_dir: tool_export_search(t, a.get("query",""))
+        def make_export_handler(t: Path) -> typing.Callable[[Dict[str, Any]], str]:
+            return lambda a: tool_export_search(t, str(a.get("query","")))
+            
+        TOOL_MAP[tool_name] = typing.cast(Any, make_export_handler(target_dir))
 
 def tool_export_search(export_dir: Path, query: str = "") -> str:
     """Basic search over extracted JSON/TXT files in an export."""
@@ -777,7 +858,7 @@ def tool_export_search(export_dir: Path, query: str = "") -> str:
                     idx = content.lower().find(query.lower())
                     start = max(0, idx - 40)
                     end = min(len(content), idx + 80)
-                    snippet = content[start:end].replace('\n', ' ')
+                    snippet = typing.cast(Any, content)[start:end].replace('\n', ' ')
                     results.append(f"Match in {filepath.name}: ...{snippet}...")
         except: pass
         
@@ -912,6 +993,9 @@ def tool_check_permissions() -> str:
         try:
             # Ensure p is a Path object for open()
             target = Path(str(p))
+            if not target.exists():
+                results[name] = "Not Found"
+                continue
             with open(target, 'rb') as f:
                 f.read(1)
             results[name] = "Access Granted"
@@ -1010,33 +1094,52 @@ def make_tool_handler(tool_name):
                     db_path = val.get('filePath','')
                     break
             if not db_path: return f"Not found: {tool_name}"
+            target_file = os.path.expanduser(str(db_path))
+            if not os.path.exists(target_file):
+                return f"Path does not exist: {target_file}"
             tmp = tempfile.mktemp(suffix='.db')
-            shutil.copy2(os.path.expanduser(db_path), tmp)
+            shutil.copy2(target_file, tmp)
             conn = sqlite3.connect(tmp)
             cur = conn.cursor()
             tables = [r[0] for r in cur.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()]
-            best,count = tables[0],0
-            for t in tables:
+            if "chrome" in tool_name.lower() and "history" in tool_name.lower():
                 try:
-                    n=cur.execute(
-                        f"SELECT count(*) FROM [{t}]"
-                    ).fetchone()[0]
-                    if n>count: count,best=n,t
-                except: pass
-            rows=cur.execute(
-                f"SELECT * FROM [{best}] LIMIT {limit}"
-            ).fetchall()
-            cols=[r[1] for r in cur.execute(
-                f"PRAGMA table_info([{best}])"
-            )]
+                    q = f"""
+                        SELECT u.url, u.title, u.visit_count,
+                        datetime((u.last_visit_time/1000000)-11644473600,'unixepoch') as visited
+                        FROM urls u
+                        ORDER BY u.last_visit_time DESC
+                        LIMIT {limit}
+                    """
+                    rows = cur.execute(q).fetchall()
+                    cols = ["url", "title", "visit_count", "visited"]
+                    best = "urls (joined history)"
+                    count = len(rows)
+                except Exception as e:
+                    return f"Error executing specific Chrome History query: {e}"
+            else:
+                best,count = tables[0],0
+                for t in tables:
+                    try:
+                        n=cur.execute(
+                            f"SELECT count(*) FROM [{t}]"
+                        ).fetchone()[0]
+                        if n>count: count,best=n,t
+                    except: pass
+                rows=cur.execute(
+                    f"SELECT * FROM [{best}] LIMIT {limit}"
+                ).fetchall()
+                cols=[r[1] for r in cur.execute(
+                    f"PRAGMA table_info([{best}])"
+                )]
             conn.close()
             os.unlink(tmp)
             out=f"{best}: {count} rows\n"
             out+=" | ".join(cols)+"\n---\n"
             for r in rows:
-                out+=" | ".join(str(v)[:40] if v 
+                out+=" | ".join(typing.cast(Any, str(v))[:40] if v 
                                 else '' for v in r)+"\n"
             return out
         except Exception as e:
@@ -1046,8 +1149,8 @@ def make_tool_handler(tool_name):
 def rebuild_tools():
     """Live-rebuilds the TOOLS array exposed to MCP based on approvals/pauses."""
     global TOOLS, DYNAMIC_PATHS
-    new_tools = []
-    new_paths = {}
+    new_tools: List[Dict[str, Any]] = []
+    new_paths: Dict[str, str] = {}
     
     STATIC_MAP = {
         "ldp_diagnostics": "system",
@@ -1061,9 +1164,10 @@ def rebuild_tools():
     
     # 1. Register base system tools
     for st in ALL_STATIC_TOOLS:
-        cat = STATIC_MAP.get(st["name"], "unknown")
+        st_name = str(st["name"])
+        cat = STATIC_MAP.get(st_name, "unknown")
         if cat != "system":
-            if approvals.is_app_denied(st["name"], cat) or approvals.is_app_paused(st["name"]): continue
+            if approvals.is_app_denied(st_name, cat) or approvals.is_app_paused(st_name): continue
         new_tools.append(st)
     
     # 2. Register dynamic apps from Brain
@@ -1093,7 +1197,8 @@ def rebuild_tools():
     except Exception as e:
         sys.stderr.write(f"[LDP] rebuild_tools error: {e}\n")
         
-    TOOLS[:] = new_tools
+    TOOLS.clear()
+    TOOLS.extend(new_tools)
     DYNAMIC_PATHS.update(new_paths)
     
     # Auto-register handlers for all tools missing one
@@ -1143,13 +1248,14 @@ class ScreenWatcher:
             self._bundle_cache = {}
         return self._bundle_cache
 
-    def _save_path_mapping(self, path, app_name):
+    def _save_path_mapping(self, path: str, app_name: str):
         """Persist a resolved path → app_name into brain_knowledge.json."""
-        self._bundle_cache[path] = app_name
+        cache = self._load_bundle_cache()
+        cache[path] = app_name
         try:
             with open(self.BRAIN_PATH) as f:
                 brain = json.load(f)
-            brain["path_map"] = self._bundle_cache
+            brain["path_map"] = cache
             with open(self.BRAIN_PATH, "w") as f:
                 json.dump(brain, f, indent=2)
         except Exception:
@@ -1173,7 +1279,7 @@ class ScreenWatcher:
 
         # Rule 2: Path-based cache hit
         if exe_path:
-            cache = self._load_path_cache()
+            cache = self._load_bundle_cache()
             if exe_path in cache:
                 return cache[exe_path]
 
@@ -1258,7 +1364,9 @@ end tell'''
 
     def now(self):
         c = self.current
-        secs = int(_time.time() - c.get("since", _time.time()))
+        # Ensure 'since' is treated as float for subtraction
+        since_val = float(c.get("since", _time.time()))
+        secs = int(_time.time() - since_val)
         mins = secs // 60
         return {"app": c.get("app", ""), "window": c.get("window", ""),
                 "url": c.get("url", ""), "duration": f"{mins}m {secs%60}s"}
@@ -1267,7 +1375,7 @@ end tell'''
         if not os.path.exists(self.log_path):
             return {}
         today = datetime.now().date().isoformat()
-        app_times = {}
+        app_times: Dict[str, int] = {}
         with open(self.log_path) as f:
             for line in f:
                 try:
@@ -1279,8 +1387,11 @@ end tell'''
                     pass
         current = self.now()
         if current["app"]:
-            cur_secs = int(_time.time() - self.current.get("since", _time.time()))
-            app_times[current["app"]] = app_times.get(current["app"], 0) + cur_secs
+            since_val = float(self.current.get("since", _time.time()))
+            cur_secs = int(_time.time() - since_val)
+            # Ensure app_times is a Dict[str, int]
+            a_name = str(current["app"])
+            app_times[a_name] = int(app_times.get(a_name, 0)) + cur_secs
         return dict(sorted(app_times.items(), key=lambda x: -x[1]))
 
     def history(self, limit=50):
@@ -1289,7 +1400,7 @@ end tell'''
         with open(self.log_path) as f:
             lines = f.readlines()
         entries = []
-        for line in reversed(lines[-limit:]):
+        for line in reversed(typing.cast(Any, lines)[-limit:]):
             try:
                 entries.append(json.loads(line))
             except Exception:
@@ -1331,15 +1442,18 @@ def tool_screen_today(args):
     if not summary:
         return "No activity recorded today yet. Watcher started at server launch."
     out = "Time spent today:\n\n"
-    total = sum(summary.values())
+    total = sum(typing.cast(Any, list(summary.values())))
     for app, secs in summary.items():
-        mins = secs // 60
+        secs_val = int(secs)
+        mins = secs_val // 60
         hrs = mins // 60
-        pct = int((secs / total) * 100) if total else 0
+        # Use explicit float for division
+        pct = int((float(secs_val) / float(total)) * 100) if total else 0
         time_str = f"{hrs}h {mins%60}m" if hrs > 0 else f"{mins}m"
         out += f"  {app}: {time_str} ({pct}%)\n"
-    total_hrs = total // 3600
-    total_mins = (total % 3600) // 60
+    total_val = int(total)
+    total_hrs = total_val // 3600
+    total_mins = (total_val % 3600) // 60
     out += f"\nTotal tracked: {total_hrs}h {total_mins}m"
     return out
 
@@ -1380,8 +1494,10 @@ def tool_context_now(args):
 
     today = watcher.today_summary()
     context += "TODAY SO FAR:\n"
-    for a, secs in list(today.items())[:5]:
-        context += f"  {a}: {secs//60}m\n"
+    t_items = list(today.items())
+    t_slice = typing.cast(Any, t_items)[:5]
+    for a, secs in t_slice:
+        context += f"  {a}: {int(secs)//60}m\n"
 
     try:
         msg_db = os.path.expanduser("~/Library/Messages/chat.db")
@@ -1400,13 +1516,14 @@ def tool_context_now(args):
             context += "\nRECENT MESSAGES:\n"
             for r in rows:
                 if r[0]:
-                    context += f"  {str(r[0])[:60]}\n"
+                    context += f"  {typing.cast(Any, str(r[0]))[:60]}\n"
     except Exception:
         pass
 
     try:
         hist = watcher.history(20)
-        recent_apps = list(dict.fromkeys([e["app"] for e in hist if e.get("app")]))[:5]
+        u_apps = list(dict.fromkeys([e["app"] for e in hist if e.get("app")]))
+        recent_apps = typing.cast(Any, u_apps)[:5]
         if recent_apps:
             context += f"\nRECENT APPS: {', '.join(recent_apps)}\n"
     except Exception:
@@ -1617,7 +1734,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
         data = json.loads(self.rfile.read(length).decode()) if length > 0 else {}
-        name = data.get("name")
+        name = str(data.get("name", ""))
         
         if self.path == "/api/approve":
             approvals.set_app_state(name, approved=True, paused=False)
@@ -1662,7 +1779,8 @@ def start_dashboard_server():
     except Exception:
         pass
         
-    threading.Thread(target=server.serve_forever, daemon=("--dashboard" not in sys.argv)).start()
+    if server:
+        threading.Thread(target=server.serve_forever, daemon=("--dashboard" not in sys.argv)).start()
     if "--dashboard" not in sys.argv:
         sys.stderr.write(f"[LDP] Dashboard hosted on http://127.0.0.1:{port}\n")
 
