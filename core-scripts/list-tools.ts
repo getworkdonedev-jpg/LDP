@@ -51,7 +51,7 @@ async function main() {
     }
 
     // Strict Noise Filter (Problem 3 & Fix 3)
-    const noise = ["tomb", "backup", "cache", "thumbnail", "authorization", "akd", "siri", "heavy_ad", "tipkit", "dock", "vscdb", "metadata", "plist", "json", "coredatabackend", "drivefs"];
+    const noise = ["tomb", "backup", "cache", "thumbnail", "authorization", "akd", "siri", "heavy_ad", "tipkit", "dock", "vscdb", "metadata", "plist", "json", "coredatabackend", "drivefs", "fsck", "launchd", "shutdown_monitor"];
     
     const isCore = Object.values(coreAppsMap).includes(name) || Object.keys(coreAppsMap).some(k => name.includes(k));
     const isNoise = noise.some(n => name.toLowerCase().includes(n) || sol.appName.toLowerCase().includes(n) || sol.filePath.toLowerCase().includes(n));
@@ -59,6 +59,9 @@ async function main() {
     // Skip if it is noise AND not a core app
     if (isNoise && !isCore) continue;
     
+    // Limit logs to the most important ones (System, Wifi, Install)
+    if (name.includes("logs_") && !name.includes("system_log") && !name.includes("wifi_log") && !name.includes("install_log")) continue;
+
     // Extra strict: if it has "drivefs" anywhere, skip it NO MATTER WHAT (Fix 3)
     if (sol.filePath.toLowerCase().includes("drivefs") || name.includes("drivefs")) continue;
 
@@ -79,10 +82,17 @@ async function main() {
     });
   }
 
-  // Final trim: if we have more than 22 tools, remove low confidence unknowns
+  // Final trim: target 20-22
+  finalTools.sort((a,b) => {
+    const aCore = Object.values(coreAppsMap).includes(a.name) ? 1 : 0;
+    const bCore = Object.values(coreAppsMap).includes(b.name) ? 1 : 0;
+    if (aCore !== bCore) return bCore - aCore;
+    return b.confidence - a.confidence;
+  });
+
   if (finalTools.length > 22) {
-     finalTools.sort((a,b) => (Object.values(coreAppsMap).includes(b.name)?1:0) - (Object.values(coreAppsMap).includes(a.name)?1:0) || b.confidence - a.confidence);
-     // finalTools.splice(22); // No, let's keep all valid ones but name them nicely
+     const coreCount = finalTools.filter(t => Object.values(coreAppsMap).includes(t.name)).length;
+     finalTools.splice(Math.max(22, coreCount));
   }
 
   console.log(JSON.stringify(finalTools));
