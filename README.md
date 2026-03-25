@@ -1,13 +1,13 @@
 # LDP (Local Data Protocol) Server
 
-A powerful local MCP server that allows Cursor (or any MCP client) to query your Signal Desktop messages, Chrome history, shell history, and more — all from your local machine.
+A powerful local MCP server that allows Cursor (or any MCP client) to query your local data—including messaging history (WhatsApp, Signal, Telegram, Facebook, Instagram), browser history, and more—all without your data ever leaving your machine.
 
 ## 🚀 Key Features:
-- **Signal Decryption**: Decrypts Signal Desktop's SQLite database locally using Chromium `safeStorage` AES decryption.
-- **Chrome History**: Query your recent browser activity.
-- **Shell History**: Access your recent terminal commands.
-- **Git Logs**: Fetch commit history for local repos.
-- **Local SQLite Scanner**: Finds all SQLite databases on your Mac.
+- **Unified Messaging Search**: Query your local message databases for WhatsApp, Signal, Telegram, Facebook Messenger, and Instagram.
+- **Privacy-First Decryption**: Handles locally encrypted databases (like Signal and WhatsApp) using on-device security keys.
+- **Browser History**: Query recent activity from Chrome, Brave, and Safari.
+- **System Insights**: Access shell history, git logs, and local file metadata.
+- **Local Data Discovery**: Automatically scans and classifies SQLite databases on your Mac.
 
 ## 🛠 Setup
 
@@ -20,9 +20,8 @@ A powerful local MCP server that allows Cursor (or any MCP client) to query your
 2. **Install Dependencies**:
    Requires Python 3 and Node.js.
    ```bash
-   # Install Signal's SQLCipher bridge
    cd "core-scripts"
-   npm install @signalapp/sqlcipher
+   npm install
    ```
 
 3. **Configure Cursor**:
@@ -31,10 +30,10 @@ A powerful local MCP server that allows Cursor (or any MCP client) to query your
    - Add a new server:
      - **Name**: `LDP-Local`
      - **Type**: `command`
-     - **Command**: `python3 /Users/karthikperumalla/Desktop/LDP/ldp-server/ldp_server.py`
+     - **Command**: `python3 /Users/karthikperumalla/Desktop/LDP/core-scripts/ldp_server.py`
 
 ## 🔒 Security
-This server runs entirely locally. It reads your Signal database by fetching the `Signal Safe Storage` key from your macOS Keychain. No data is ever sent to external servers.
+LDP runs entirely on your local machine. It accesses local databases by fetching the necessary security keys from your macOS Keychain or local config files. **Zero bytes of personal data are sent to external servers.**
 
 ---
 *Created for the Local Data Protocol (LDP) project.*

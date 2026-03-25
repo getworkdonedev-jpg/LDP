@@ -578,6 +578,8 @@ The following apps have verified connector implementations or fingerprint entrie
 | WhatsApp Desktop | messaging | none (SQLite) | macOS |
 | iMessage | messaging | none (SQLite) | macOS |
 | Telegram Desktop | messaging | SQLite | macOS, Linux |
+| Facebook Messenger | messaging | SQLite | macOS |
+| Instagram Desktop | messaging | SQLite | macOS |
 | VS Code | developer | none (SQLite) | macOS, Linux, Windows |
 | Cursor | developer | none (SQLite) | macOS |
 | Obsidian | notes | none (SQLite) | macOS, Linux, Windows |
