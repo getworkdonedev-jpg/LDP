@@ -134,15 +134,16 @@ A connector is a named implementation of the `BaseConnector` interface that know
 
 Connectors are pure data adapters. They contain no AI logic.
 
-### 3.3 Context Packer
+### 3.3 Context Packer (BM25 Engine)
 
-The `ContextPacker` takes raw rows from one or more connectors and produces a relevance-ranked, token-budgeted context payload. It scores rows by:
+The `ContextPacker` takes raw rows from one or more connectors and produces a relevance-ranked, token-budgeted context payload. It uses the **BM25 (Best Matching 25)** probabilistic model for keyword relevance, combined with recency and importance weights.
 
-- Keyword overlap with the query (60% weight)
-- Recency of the data (30% weight)
-- Connector-assigned importance weight (10% weight)
+**Scoring components:**
+- **BM25 Score (60%)**: Probabilistic keyword relevance accounting for term frequency (TF) and inverse document frequency (IDF).
+- **Recency (30%)**: Decay-based score ensuring recent data is prioritized.
+- **Importance (10%)**: Connector-assigned weight for critical entries.
 
-The budget default is 8,000 tokens. Rows are packed in descending score order until the budget is reached.
+This hybrid approach ensures that exact keyword matches (e.g., "find invoice 123") are prioritized instantly, while still maintaining high ranking for relevant recent context.
 
 ### 3.4 MCP Adapter
 

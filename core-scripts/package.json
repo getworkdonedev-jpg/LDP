@@ -1,6 +1,6 @@
 {
   "name": "@ldp-protocol/sdk",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "description": "LDP — Local Data Protocol. Privacy-first AI access to personal local data.",
   "keywords": [
     "ldp",

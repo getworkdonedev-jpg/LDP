@@ -92,42 +92,74 @@ export class ConsentStore {
 
 export class ContextPacker {
   private readonly budget: number;
+  private readonly k1 = 1.2;
+  private readonly b  = 0.75;
 
   constructor(tokenBudget = 8_000) { this.budget = tokenBudget; }
 
-  private score(row: Row, query: string): number {
-    /**
-     * FIX HIGH-06: filter out empty tokens before scoring.
-     * Original: query.toLowerCase().split(/\s+/) on an empty string
-     * produces [""], which .includes() matches on every chunk,
-     * giving all chunks a relevance score of 1.0.
-     * Fix: filter(Boolean) removes the empty string token.
-     */
-    const qWords  = new Set(
-      query.toLowerCase().split(/\s+/).filter(Boolean)
-    );
-    const text    = Object.values(row).join(" ").toLowerCase();
-
-    // If query is truly empty, relevance = 0 (rely on recency only)
-    const hits    = qWords.size === 0
-      ? 0
-      : [...qWords].filter(w => text.includes(w)).length;
-
-    const recency = (row._recency as number) ?? 0.5;
-    const weight  = (row._weight  as number) ?? 1.0;
-
-    return (qWords.size === 0 ? 0 : hits / qWords.size) * 0.6
-         + recency * 0.3
-         + weight  * 0.1;
-  }
-
+  /**
+   * BM25 relevance scoring.
+   * score(D, Q) = Σ [ IDF(q_i) * (f(q_i, D) * (k1 + 1)) / (f(q_i, D) + k1 * (1 - b + b * (|D| / avgdl))) ]
+   */
   pack(sources: Record<string, Row[]>, query: string): ContextResult {
-    const scored: Array<[number, Row]> = [];
+    const allRows: Row[] = [];
     for (const [src, rows] of Object.entries(sources)) {
       for (const row of rows) {
-        scored.push([this.score(row, query), { ...row, _src: src }]);
+        allRows.push({ ...row, _src: src });
       }
     }
+
+    const qWords = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (qWords.length === 0 || allRows.length === 0) {
+      return this.packBasic(allRows, query, sources);
+    }
+
+    // Pass 1: Global Stats
+    const N = allRows.length;
+    const docTexts = allRows.map(r => Object.values(r).join(" ").toLowerCase());
+    const docLens  = docTexts.map(t => t.split(/\s+/).length);
+    const avgdl    = docLens.reduce((a, b) => a + b, 0) / N;
+
+    const idfs: Record<string, number> = {};
+    for (const word of qWords) {
+      const n = docTexts.filter(t => t.includes(word)).length;
+      idfs[word] = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+    }
+
+    // Pass 2: BM25 Scoring
+    const scored: Array<[number, Row]> = allRows.map((row, i) => {
+      const text = docTexts[i];
+      const Ld   = docLens[i];
+      
+      let bm25 = 0;
+      for (const word of qWords) {
+        const tf = (text.split(word).length - 1); // simple frequency
+        const idf = idfs[word] ?? 0;
+        bm25 += idf * (tf * (this.k1 + 1)) / (tf + this.k1 * (1 - this.b + this.b * (Ld / avgdl)));
+      }
+
+      const recency = (row._recency as number) ?? 0.5;
+      const weight  = (row._weight  as number) ?? 1.0;
+
+      // Final score: BM25 (scaled) + recency + weight
+      // Normalized BM25 to 0-1 range roughly for combination
+      const finalScore = (Math.tanh(bm25) * 0.6) + (recency * 0.3) + (weight * 0.1);
+      return [finalScore, row];
+    });
+
+    return this.assemble(scored, query, sources);
+  }
+
+  private packBasic(allRows: Row[], query: string, sources: Record<string, Row[]>): ContextResult {
+    const scored: Array<[number, Row]> = allRows.map(row => {
+      const recency = (row._recency as number) ?? 0.5;
+      const weight  = (row._weight  as number) ?? 1.0;
+      return [(recency * 0.8) + (weight * 0.2), row];
+    });
+    return this.assemble(scored, query, sources);
+  }
+
+  private assemble(scored: Array<[number, Row]>, query: string, sources: Record<string, Row[]>): ContextResult {
     scored.sort(([a], [b]) => b - a);
 
     const packed: Row[] = [];

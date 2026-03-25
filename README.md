@@ -4,9 +4,9 @@ A powerful local MCP server that allows Cursor (or any MCP client) to query your
 
 ## 🚀 Key Features:
 - **Unified Messaging Search**: Query your local message databases for WhatsApp, Signal, Telegram, Facebook Messenger, and Instagram.
+- **BM25 Relevancy Engine**: High-accuracy keyword search using the industry-standard BM25 algorithm—lightning fast and zero-AI required.
 - **Privacy-First Decryption**: Handles locally encrypted databases (like Signal and WhatsApp) using on-device security keys.
-- **Browser History**: Query recent activity from Chrome, Brave, and Safari.
-- **System Insights**: Access shell history, git logs, and local file metadata.
+- **Hybrid Intelligence**: Combines deterministic BM25 keyword matching with future-ready semantic search roadmaps.
 - **Local Data Discovery**: Automatically scans and classifies SQLite databases on your Mac.
 
 ## 🛠 Setup
