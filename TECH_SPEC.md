@@ -3,7 +3,7 @@
 
 **Status:** Draft  
 **Authors:** LDP Protocol Contributors  
-**Repository:** https://github.com/ldp-protocol/spec  
+**Repository:** https://github.com/getworkdonedev-jpg/LDP  
 **License:** Apache 2.0  
 **Last Updated:** March 2026
 
@@ -608,7 +608,7 @@ The current spec is v1.0.0. All implementations must declare the spec version th
 
 ## 15. Governance
 
-The LDP specification is maintained by the LDP Protocol Contributors at https://github.com/ldp-protocol/spec.
+The LDP specification is maintained by the LDP Protocol Contributors at https://github.com/getworkdonedev-jpg/LDP.
 
 Changes are proposed via GitHub Issues and accepted via Pull Request with review from at least two maintainers. Security-relevant changes require 72-hour minimum review period.
 

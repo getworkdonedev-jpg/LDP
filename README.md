@@ -13,7 +13,7 @@ A powerful local MCP server that allows Cursor (or any MCP client) to query your
 
 1. **Clone the repository**:
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/getworkdonedev-jpg/LDP.git
    cd LDP
    ```
 
