@@ -13,13 +13,13 @@
     "local-first",
     "encryption"
   ],
-  "homepage": "https://ldp-protocol.dev",
+  "homepage": "https://github.com/getworkdonedev-jpg/LDP#readme",
   "bugs": {
-    "url": "https://github.com/ldp-protocol/ldp-js/issues"
+    "url": "https://github.com/getworkdonedev-jpg/LDP/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ldp-protocol/ldp-js.git"
+    "url": "git+https://github.com/getworkdonedev-jpg/LDP.git"
   },
   "license": "GPL-3.0",
   "author": "Karthik Perumalla <karthikhub7@gmail.com>",
