@@ -16,6 +16,7 @@
 
 import * as fs   from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import {
   MsgType, RiskTier, LDPMessage, ConnectorDescriptor,
   BaseConnector, Row, ContextResult,
@@ -99,7 +100,9 @@ export class ContextPacker {
   private readonly k1 = 1.2;
   private readonly b  = 0.75;
 
-  constructor(tokenBudget = 8_000) { this.budget = tokenBudget; }
+  constructor(private readonly connectors?: Map<string, BaseConnector>, tokenBudget = 8_000) { 
+    this.budget = tokenBudget; 
+  }
 
   /**
    * BM25 relevance scoring.
@@ -108,8 +111,18 @@ export class ContextPacker {
   pack(sources: Record<string, Row[]>, query: string): ContextResult {
     const allRows: Row[] = [];
     for (const [src, rows] of Object.entries(sources)) {
+      const connector = this.connectors?.get(src);
+      const dbPath    = connector?.dbPath ?? "local_db";
+      
       for (const row of rows) {
-        allRows.push({ ...row, _src: src });
+        const rawContent = JSON.stringify(row);
+        const hash = crypto.createHash("sha256").update(rawContent).digest("hex");
+        allRows.push({ 
+          ...row, 
+          _src: src, 
+          _hash: hash,
+          _dbPath: dbPath 
+        });
       }
     }
 
@@ -170,15 +183,22 @@ export class ContextPacker {
     let tokens = 0;
     for (const [, row] of scored) {
       const t = Math.floor(JSON.stringify(row).length / 4);
-      if (tokens + t > this.budget) break;
+      if (tokens + t > this.budget) break;   // was: activeBudget (undefined ReferenceError)
       packed.push(row);
       tokens += t;
     }
 
     const totalRows = Object.values(sources).reduce((s, r) => s + r.length, 0);
+    const citations = packed.map((r, i) => ({
+      hash: r._hash!,
+      dbPath: r._dbPath!,
+      originalIndex: i
+    }));
+
     return {
       query, chunks: packed, tokensUsed: tokens,
       sources: Object.keys(sources), totalRows, packedRows: packed.length,
+      citations
     };
   }
 }
@@ -262,6 +282,7 @@ export class LDPEngine {
   private readonly cache:    SchemaCache;
   private readonly consent:  ConsentStore;
   private readonly packer:   ContextPacker;
+  private readonly budget:   number;
   readonly audit:            AuditLog;
 
   // FIX HIGH-04: connectors is now public readonly so MCPAdapter
@@ -282,12 +303,13 @@ export class LDPEngine {
 
   constructor(opts: LDPEngineOptions = {}) {
     this.dataDir   = opts.dataDir ?? LDP_DIR;
+    this.budget    = opts.tokenBudget ?? 8_000;
     this.approvalCb = opts.approvalCb ?? null;
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     this.cache   = new SchemaCache (path.join(this.dataDir, "schema_cache.enc"));
     this.consent = new ConsentStore(path.join(this.dataDir, "consent.enc"));
     this.audit   = new AuditLog   (path.join(this.dataDir, "audit.enc"));
-    this.packer  = new ContextPacker(opts.tokenBudget);
+    this.packer  = new ContextPacker(this.connectors, this.budget);
   }
 
   start(): this { this.audit.start(); return this; }
@@ -390,7 +412,8 @@ export class LDPEngine {
 
   // ── Query ─────────────────────────────────────────────────────────────────
 
-  async query(question: string, sources?: string[]): Promise<LDPMessage> {
+  async query(question: string, sources: string[] = ["*"], opts: { budget?: number } = {}): Promise<LDPMessage> {
+    const activeBudget = opts.budget ?? this.budget;
     const targets = sources ?? [...this.connected];
     if (!targets.length) return errorMessage("No connected sources");
 
@@ -477,6 +500,36 @@ export class LDPEngine {
       connected:  [...this.connected],
       registered: [...this.connectors.keys()],
       consented:  this.consent.listConsented(),
+    };
+  }
+
+  /**
+   * Verify that the LLM response has at least 70% semantic overlap with the retrieved context.
+   * Simple implementation: checks for presence of key terms/phrases from snippets.
+   */
+  verifyResponse(response: string, context: ContextResult): { 
+    valid: boolean, 
+    overlap: number, 
+    citationsFound: number 
+  } {
+    const snippets = context.chunks.map(c => JSON.stringify(c).toLowerCase());
+    const respLower = response.toLowerCase();
+    
+    // We break the response into words and check how many exist in the snippets
+    const respWords = response.toLowerCase().split(/\W+/).filter(w => w.length > 3);
+    if (respWords.length === 0) return { valid: true, overlap: 1.0, citationsFound: 0 };
+
+    let found = 0;
+    const snippetText = snippets.join(" ");
+    for (const word of respWords) {
+      if (snippetText.includes(word)) found++;
+    }
+
+    const overlap = found / respWords.length;
+    return {
+      valid: overlap >= 0.7,
+      overlap,
+      citationsFound: found
     };
   }
 

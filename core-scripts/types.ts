@@ -61,6 +61,7 @@ export interface LDPMessage {
   readonly payload:    Record<string, unknown>;
   readonly source?:    string;
   readonly risk:       RiskTier;
+  readonly status?:    "SUCCESS" | "PENDING_USER_APPROVAL" | "ERROR";
 }
 
 export function createMessage(
@@ -125,10 +126,13 @@ export interface Row {
   _src?:     string;
   _recency?: number;
   _weight?:  number;
+  _hash?:    string;
+  _dbPath?:  string;
 }
 
 export interface BaseConnector {
   readonly descriptor: ConnectorDescriptor;
+  readonly dbPath?:    string; // Source-Anchored Citation
   discover(): Promise<boolean>;
   schema():   Promise<SchemaMap>;
   read(query: string, limit?: number): Promise<Row[]>;
@@ -143,6 +147,11 @@ export interface ContextResult {
   readonly sources:    string[];
   readonly totalRows:  number;
   readonly packedRows: number;
+  readonly citations?: Array<{
+    hash: string;
+    dbPath: string;
+    originalIndex: number;
+  }>;
 }
 
 // ── Consent ───────────────────────────────────────────────────────────────────

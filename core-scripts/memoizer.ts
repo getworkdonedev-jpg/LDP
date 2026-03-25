@@ -10,16 +10,20 @@ export class SessionMemoizer {
 
   /**
    * Record a failure for a specific delegate and mode.
+   * First failure: sets a short 60s probe window (we want to retry once).
+   * Second failure within that window: escalates to the full 30-minute TTL.
    */
   recordFailure(delegate_id: string, mode: PayloadMode): void {
     const key = `${delegate_id}:${mode}`;
     const entry = this.failCache.get(key);
-    
-    // If it fails twice, cache it for 30 minutes
-    if (entry) {
-      entry.expires = Date.now() + this.TTL_MS;
+    const now = Date.now();
+
+    if (entry && entry.expires > now) {
+      // Second failure while still in the probe window → full 30-minute ban
+      entry.expires = now + this.TTL_MS;
     } else {
-      this.failCache.set(key, { mode, expires: 0 }); // First fail tracker
+      // First failure → short 60s probe window so we retry once before banning
+      this.failCache.set(key, { mode, expires: now + 60_000 });
     }
   }
 

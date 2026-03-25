@@ -72,6 +72,10 @@ export class GovernedSession {
       
       return result;
     } catch (e) {
+      // CRITICAL: ContractViolationError must never be swallowed or retried —
+      // the circuit is blown; propagate immediately so the caller can handle abort.
+      if (e instanceof ContractViolationError) throw e;
+
       if (mode === PayloadMode.MODE_3) {
         this.memoizer.recordFailure(delegate_id, mode);
         this.obs.logFallback(this.span, mode, PayloadMode.MODE_1, String(e));

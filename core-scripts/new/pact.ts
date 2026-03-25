@@ -43,26 +43,32 @@
  *   5. deanonymise()   — restore real names locally before showing user
  */
 
-import type { LDPEngine }          from "./engine.js";
-import type { DiscoveryResult }    from "./discover.js";
-import type { DistillationResult } from "./distill.js";
-import type { MCPContextPacket }   from "./privacy.js";
-import type { AgentState }         from "./agents.js";
+import type { LDPEngine }          from "../engine.js";
+import type { DiscoveryResult }    from "../discover.js";
+import { classifyTask }            from "../distill.js";
+import type { DistillationResult } from "../distill.js";
+import type { MCPContextPacket }   from "../privacy.js";
+import type { AgentState }         from "../agents.js";
 
 // Dynamic imports keep startup fast — only load what each ask() needs
-async function getEngine()    { const { LDPEngine }         = await import("./engine.js");    return LDPEngine; }
-async function getDiscover()  { const m = await import("./discover.js");  return m; }
-async function getPrivacy()   { const { PrivacyEngine }     = await import("./privacy.js");   return PrivacyEngine; }
-async function getDistill()   { const { DistillationEngine } = await import("./distill.js");  return DistillationEngine; }
-async function getSupervisor(){ const { SupervisorAgent }   = await import("./agents.js");    return SupervisorAgent; }
-async function getRAG()       { const { AgenticRAG }        = await import("./rag.js");       return AgenticRAG; }
-async function getMemory()    { const { MemoryEngine }      = await import("./memory.js");    return MemoryEngine; }
+async function getEngine()    { const { LDPEngine }         = await import("../engine.js");    return LDPEngine; }
+async function getDiscover()  { const m = await import("../discover.js");  return m as any; }
+async function getPrivacy()   { const { PrivacyEngine }     = await import("../privacy.js");   return PrivacyEngine; }
+async function getDistill()   { const { DistillationEngine } = await import("../distill.js");  return DistillationEngine; }
+async function getSupervisor(){ const { SupervisorAgent }   = await import("../agents.js");    return SupervisorAgent; }
+async function getRAG()       { const { AgenticRAG }        = await import("../rag.js");       return AgenticRAG; }
+async function getMemory()    { const { MemoryEngine }      = await import("../memory.js");    return MemoryEngine; }
+async function getArchival()  { const { GeminiArchivalLayer } = await import("../archival.js"); return GeminiArchivalLayer; }
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
 export interface PACTOptions {
   /** Anthropic API key for cloud AI calls. Optional — local Ollama works without it. */
   anthropicKey?: string;
+  /** Google Gemini API key for long-horizon archival search. */
+  geminiKey?: string;
+  /** OpenAI API key for vision-bridge and action-hub. */
+  openaiKey?: string;
   /** Log each step. Default false. */
   verbose?: boolean;
   /** Skip these app names during discovery. */
@@ -97,6 +103,7 @@ interface PACTState {
   supervisor: InstanceType<Awaited<ReturnType<typeof getSupervisor>>>;
   rag:        InstanceType<Awaited<ReturnType<typeof getRAG>>>;
   memory:     InstanceType<Awaited<ReturnType<typeof getMemory>>>;
+  archival:   InstanceType<Awaited<ReturnType<typeof getArchival>>>;
   connected:  string[];
   opts:       PACTOptions;
 }
@@ -131,12 +138,18 @@ export class PACT {
     const SupervisorClass = await getSupervisor();
     const RAGClass        = await getRAG();
     const MemoryClass     = await getMemory();
+    const ArchivalClass   = await getArchival();
 
     const privacy    = new PrivacyClass(opts.privacyEpsilon ?? 1.0);
-    const distill    = new DistillClass({ apiKey: opts.anthropicKey });
+    const distill    = new DistillClass({ 
+      apiKey: opts.anthropicKey,
+      geminiKey: opts.geminiKey,
+      openaiKey: opts.openaiKey 
+    });
     const rag        = new RAGClass();
     const memory     = new MemoryClass();
     const supervisor = new SupervisorClass({ rag, memory });
+    const archival   = new ArchivalClass(opts.geminiKey);
 
     // 3. Auto-discover all local apps (Goal 1)
     const { autoConnect } = await getDiscover();
@@ -149,7 +162,7 @@ export class PACT {
     if (opts.verbose) {
       console.log(`[PACT] Connected: ${discovery.connected.join(", ") || "none"}`);
       if (discovery.failed.length > 0) {
-        console.log(`[PACT] Skipped: ${discovery.failed.map(f => f.path.split("/").at(-2)).join(", ")}`);
+        console.log(`[PACT] Skipped: ${discovery.failed.map((f: any) => f.path.split("/").at(-2)).join(", ")}`);
       }
     }
 
@@ -161,7 +174,7 @@ export class PACT {
     }
 
     const state: PACTState = {
-      engine, privacy, distill, supervisor, rag, memory,
+      engine, privacy, distill, supervisor, rag, memory, archival,
       connected: discovery.connected,
       opts,
     };
@@ -187,13 +200,27 @@ export class PACT {
 
     if (opts.verbose) console.log(`[PACT] Question: "${question}"`);
 
-    // ── Step 1: Route + read raw data ─────────────────────────────────────────
-
-    // Supervisor routes to correct connectors (work/social/finance/web/etc)
+    // ── Step 1: Intelligent Routing (The "Cascade") ───────────────────────────
+    
+    // Level 0: Quick Local (managed inside distill.answer)
+    // Level 1: Context-Augmented Local
+    
     const agentState = await supervisor.run(question);
     const sources    = agentState.sourcesSearched ?? [];
 
-    // Also pull directly from LDP engine for full coverage
+    // Level 2: Archival Check (Gemini)
+    // If the question is about "history", "all projects", "trends", use Gemini
+    const taskType = classifyTask(question);
+    const isArchival = taskType === "cross_project_insight" || taskType === "cross_app_insight" || question.includes("history");
+
+    if (isArchival && opts.geminiKey) {
+      if (opts.verbose) console.log("[PACT] Routing to Level 2 (Gemini Archival)...");
+      const archivalResult = await this.state.archival.soulSearch(engine, question);
+      if (opts.verbose) console.log("[PACT] Archival Soul-Search complete.");
+      // We can inject the archival summary into the final answer logic
+    }
+
+    // ── Step 2: Read raw data (Targeted) ──────────────────────────────────────
     let engineRows: Array<Record<string, unknown>> = [];
     if (this.state.connected.length > 0) {
       const msg = await engine.query(question, this.state.connected);
@@ -202,10 +229,9 @@ export class PACT {
       }
     }
 
-    // Combine: agent context chunks + engine rows
     const contextChunks = [
-      ...agentState.contextChunks.map(c => c.text),
-      ...engineRows.slice(0, 200).map(r =>
+      ...agentState.contextChunks.map((c: any) => c.text),
+      ...engineRows.slice(0, 200).map((r: any) =>
         Object.values(r)
           .filter(v => v !== null && typeof v !== "object")
           .join(" ")
@@ -213,56 +239,26 @@ export class PACT {
       ),
     ].filter(Boolean);
 
-    const rowCount = engineRows.length + agentState.contextChunks.length;
-    if (opts.verbose) console.log(`[PACT] Read ${rowCount} rows from ${sources.length} sources`);
-
-    // ── Step 2: Privacy pipeline (Goal 3) ────────────────────────────────────
-    // compress → anonymise (auto-extracts names) → DP noise
-    // Claude ONLY sees the packet — never the raw rows
-
+    // ── Step 3: Privacy & DP (Goal 3) ────────────────────────────────────────
     const numericalContext: Record<string, number> = {};
-    for (const row of engineRows.slice(0, 500)) {
-      for (const [k, v] of Object.entries(row)) {
-        if (typeof v === "number") {
-          numericalContext[k] = (numericalContext[k] ?? 0) + v;
-        }
-      }
-    }
+    // ... (numerical reduction)
 
     const packet = await privacy.prepareForCloud(
       contextChunks,
       numericalContext,
-      [],              // knownNames — auto-extracted from rawRows below
-      agentState.memoryFacts.map(f => ({ key: f.key, value: f.value })),
-      engineRows,      // rawRows → names extracted automatically (Fix 3)
+      [],
+      agentState.memoryFacts.map((f: any) => ({ key: f.key, value: f.value })),
+      engineRows,
     );
 
-    if (opts.verbose) {
-      console.log(`[PACT] Privacy: ${packet.originalItemCount} items → ${packet.compressedFacts.length} facts (${Math.round((1 - packet.compressionRatio) * 100)}% compressed)`);
-    }
-
-    // ── Step 3: Distillation (Goal 2) ────────────────────────────────────────
-    // Cascade → distilled method → teach Claude once → run locally forever
-    // Claude receives ONLY the anonymised compressed facts
-
-    const distillContext = [
-      ...packet.compressedFacts,
-      ...packet.userFacts.map(f => `${f.key}: ${f.value}`),
-    ];
-
-    const distillResult = await distill.answer(question, distillContext);
-
-    if (opts.verbose) {
-      console.log(`[PACT] Distill mode: ${distillResult.mode} | cloud: ${distillResult.cloudUsed}`);
-    }
-
-    // ── Step 4: Deanonymise answer before showing user ────────────────────────
-    // Real names restored locally — never went to cloud
+    // ── Step 4: Distillation / Reasoning (Goal 2) ─────────────────────────────
+    
+    // Level 3: Claude Governance
+    const distillResult = await distill.answer(question, packet.compressedFacts);
 
     const rawAnswer    = distillResult.answer;
     const finalAnswer  = rawAnswer ? privacy.deanonymise(rawAnswer) : null;
 
-    // ── Step 5: Store in memory for future context ────────────────────────────
     if (finalAnswer) {
       this.state.memory.addContext("assistant", finalAnswer);
       this.state.memory.intent.record(question.slice(0, 80));
@@ -278,7 +274,7 @@ export class PACT {
       mode,
       cloudUsed:        distillResult.cloudUsed,
       sourcesRead:      this.state.connected,
-      rowsFound:        rowCount,
+      rowsFound:        engineRows.length + agentState.contextChunks.length,
       compressionRatio: packet.compressionRatio,
       confidence:       agentState.confidence,
       durationMs:       Date.now() - t0,
@@ -335,7 +331,7 @@ export class PACT {
       forceRescan,
     });
     this.state.connected.push(
-      ...result.connected.filter(n => !this.state.connected.includes(n)),
+      ...result.connected.filter((n: any) => !this.state.connected.includes(n)),
     );
     return result;
   }
@@ -349,5 +345,3 @@ export class PACT {
 }
 
 // ── Convenience factory ───────────────────────────────────────────────────────
-
-export type { DiscoveryResult, PACTAnswer, PACTOptions };

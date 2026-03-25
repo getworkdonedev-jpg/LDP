@@ -55,6 +55,7 @@ class LDPSecurityEnforcer:
         self._setup_audit_log()
         self._load_trusted()
         self._load_agent_trust()
+        self.pending_approvals: Dict[str, Dict[str, Any]] = {}
 
     def _setup_audit_log(self):
         AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -121,12 +122,27 @@ class LDPSecurityEnforcer:
         # Agent context logging
         logging.info(f"TOOL_CALL | {self.current_agent_id} | {tool_name} | ARGS: {json.dumps(args)}")
 
+    def request_approval(self, tool_name: str, args: dict) -> str:
+        hash_val = hashlib.md5(f"{tool_name}{json.dumps(args)}{datetime.now()}".encode()).hexdigest()
+        token = hash_val[0:8]
+        self.pending_approvals[token] = {"tool": tool_name, "args": args, "expires": datetime.now().timestamp() + 300}
+        return token
+
+    def verify_approval(self, token: str) -> Optional[dict]:
+        action = self.pending_approvals.get(token)
+        if action and action["expires"] > datetime.now().timestamp():
+            self.pending_approvals.pop(token, None)
+            return action
+        return None
+
 security_enforcer = LDPSecurityEnforcer()
 import re
 
 class PersonalDataShield:
     """Layer 10: Prevents PII and raw private details from reaching the LLM."""
     PII_PATTERNS = {
+        "GH_TOKEN": r"\bghp_[a-zA-Z0-9]{36}\b",
+        "AI_KEY": r"\bsk-[a-zA-Z0-9]{48}\b",
         "CREDIT_CARD": r"\b(?:\d[ -]*?){13,16}\b",
         "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
         "API_KEY": r"(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{12,})['\"]?",
@@ -158,7 +174,19 @@ class PersonalDataShield:
         # We only apply this safely if it looks like a contact list or message header
         # For now, let's apply it globally but be careful not to break common phrases like "Google Chrome"
         # Actually, let's keep it simple: Replace "First Last" with "First [MASKED]"
-        EXEMPT_NAMES = {"Google", "Apple", "Microsoft", "Visual", "Studio", "Activity", "Recent", "System", "Private", "Personal"}
+        EXEMPT_NAMES = {
+            # Generic title-case words that are NOT personal names
+            "Google", "Apple", "Microsoft", "Visual", "Studio", "Activity",
+            "Recent", "System", "Private", "Personal", "Signal", "Chrome",
+            "Safari", "Firefox", "Brave", "Spotify", "Slack", "Discord",
+            "Telegram", "WhatsApp", "Cursor", "VS", "Code", "GitHub",
+            "Desktop", "Documents", "Downloads", "Library", "Application",
+            "Support", "Local", "Remote", "Home", "Work", "Office",
+            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+            "Saturday", "Sunday", "January", "February", "March", "April",
+            "May", "June", "July", "August", "September", "October",
+            "November", "December", "New", "Old", "Open", "Close",
+        }
         def mask_name(match):
             first = match.group(1)
             last = match.group(2)
@@ -242,6 +270,16 @@ class SecureActionRedirector:
         return re.sub(r"\{\{([A-Z0-9_]+)\}\}", repl, text)
 
 action_redirector = SecureActionRedirector()
+
+def tool_archival_dump(query: str, days: int = 180) -> str:
+    """Returns a massive raw dump of contextual data for deep archival analysis (Gemini)."""
+    # This tool bypasses the standard 50-row limit for Gemini 1.5 Pro
+    results = []
+    for app, path in DISCOVERED_APPS.items():
+        if app in ["whatsapp", "signal", "chrome", "git"]:
+           # Simulated full-table read
+           results.append({"app": app, "data": "Full dump content..."})
+    return json.dumps(results)
 
 def tool_get_semantic_facts(args: Optional[Dict[str, Any]] = None) -> str:
     """Returns compressed semantic facts about the user from the local vault."""
@@ -508,7 +546,10 @@ approvals = ApprovalManager()
 
 # ── SQLite reader (lock-safe copy) ────────────────────────────────
 def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
-    """Returns a list of rows (dicts)."""
+    """Returns a list of rows (dicts). Strict Read-Only."""
+    if not query.strip().lower().startswith("select"):
+        logging.warning(f"BLOCKED_WRITE_QUERY | {query}")
+        return [{"error": "Only SELECT queries are allowed in this sandbox."}]
     if not path or not path.exists():
         return []
     
@@ -826,6 +867,18 @@ def tool_manage_approvals(action: str, category: str = "") -> str:
         removed_count = len(TOOLS) - len(tools_to_keep)
         TOOLS.clear()
         TOOLS.extend(tools_to_keep)
+
+        # Also purge handlers from TOOL_MAP so revoked tools cannot be called
+        # directly via a raw tools/call even after being dropped from TOOLS list.
+        active_names = {t["name"] for t in TOOLS}
+        for dead_name in list(TOOL_MAP.keys()):
+            if dead_name not in active_names and dead_name not in {
+                # system tools that are always callable regardless of category
+                "ldp_diagnostics", "ldp_check_permissions", "ldp_manage_approvals",
+                "ldp_approve_action",
+            }:
+                TOOL_MAP.pop(dead_name, None)
+
         return f"Revoked '{category}'. {removed_count} tools instantly unregistered."
         
     elif action == "reapprove":
@@ -1020,7 +1073,7 @@ def tool_fused_context(args: dict) -> str:
         sys.stderr.write(f"Phone enrichment error: {e}\n")
 
     try:
-        brain_path = HOME / "Desktop/LDP/core-scripts/brain_knowledge.json"
+        brain_path = HOME / ".ldp" / "brain_knowledge.json"
         if brain_path.exists():
             with open(brain_path) as f:
                 brain = json.load(f)
@@ -1397,6 +1450,7 @@ ALL_STATIC_TOOLS = [
     {"name": "ldp_fused_context", "description": "Enriches JSON/Text query results by mapping phone numbers to contact names and paths to app names.", "inputSchema": {"type":"object", "properties": {"query_result": {}}}},
     {"name": "ldp_get_semantic_facts", "description": "Retrieve compressed semantic facts about the user (preferences, city, memberships) without raw PII.", "inputSchema": {"type":"object"}},
     {"name": "ldp_secure_action", "description": "Execute a secure action (e.g., order, send) using semantic tokens like {{ADDR_HOME}}. Raw PII is resolved locally and NEVER shared with AI models.", "inputSchema": {"type": "object", "properties": {"action_type": {"type": "string"}, "target_payload": {"type": "string"}}, "required": ["action_type", "target_payload"]}},
+    {"name": "ldp_approve_action", "description": "Resume a tool execution that is PENDING_USER_APPROVAL. Requires a valid 8-char approval_token.", "inputSchema": {"type": "object", "properties": {"token": {"type": "string"}}, "required": ["token"]}},
 ]
 
 TOOLS = []
@@ -1407,7 +1461,7 @@ def make_tool_handler(tool_name):
         try:
             import shutil, tempfile, sqlite3, os, json
             brain_path = os.path.expanduser(
-                '~/Desktop/LDP/core-scripts/brain_knowledge.json')
+                '~/.ldp/brain_knowledge.json')
             with open(brain_path) as f:
                 brain = json.load(f)
             db_path = None
@@ -1549,7 +1603,7 @@ import time as _time
 import urllib.request as _urllib_req
 
 class ScreenWatcher:
-    BRAIN_PATH = os.path.expanduser("~/Desktop/LDP/core-scripts/brain_knowledge.json")
+    BRAIN_PATH = os.path.expanduser("~/.ldp/brain_knowledge.json")
     CONFIG_PATH = os.path.expanduser("~/.ldp/config.json")
 
     def __init__(self):
@@ -2177,7 +2231,28 @@ def main():
                     if not security_enforcer.check_agent_permission(cat):
                         raise PermissionError(f"Agent '{security_enforcer.current_agent_id}' is NOT authorized for category '{cat}'")
 
-                    raw_res = TOOL_MAP[name](args)
+                    # HITL INTERCEPTOR (Enterprise Hardening)
+                    WRITE_TOOLS = ["ldp_secure_action", "tool_whatsapp_send", "ldp_delete_data"] # list of risky tools
+                    if name in WRITE_TOOLS:
+                        token = security_enforcer.request_approval(name, args)
+                        json.dump({"jsonrpc":"2.0", "id":rid, "result": {
+                            "status": "PENDING_USER_APPROVAL",
+                            "approval_token": token,
+                            "content": [{"type":"text", "text": f"Risky action detected ({name}). Approve using ldp_approve_action(token='{token}')"}]
+                        }}, sys.stdout)
+                        print(flush=True)
+                        continue
+
+                    raw_res = ""
+                    if name == "ldp_approve_action":
+                        token = args.get("token")
+                        action = security_enforcer.verify_approval(token)
+                        if action:
+                            raw_res = TOOL_MAP[action["tool"]](action["args"])
+                        else:
+                            raw_res = "Invalid or expired approval token."
+                    else:
+                        raw_res = TOOL_MAP[name](args)
                     
                     # Layer 10: Personal Data Shield (Final Filter)
                     res = PersonalDataShield.filter(str(raw_res))

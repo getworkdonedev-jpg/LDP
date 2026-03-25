@@ -840,8 +840,16 @@ export class SystemScanner {
       { path: path.join(h, "Library/Application Support/Google/Chrome/Default/History"), app: "Chrome" },
       { path: path.join(h, "Library/Mail/V10/MailData/Envelope Index"), app: "Apple Mail" },
       { path: path.join(h, ".zsh_history"), app: "Shell History" },
-      { path: "/Users/karthikperumalla/openfoodfacts-python/.git", app: "Git Log" },
-      { path: "/Users/karthikperumalla/Desktop/LDP/.git", app: "Git Log" },
+      // Dynamic: find .git dirs in common project roots instead of hardcoding paths
+      ...(["Desktop", "Documents", "Projects", "dev", "src", "code"].flatMap(dir => {
+        const root = path.join(h, dir);
+        if (!fs.existsSync(root)) return [];
+        try {
+          return fs.readdirSync(root)
+            .map(name => ({ path: path.join(root, name, ".git"), app: "Git Log" }))
+            .filter(p => fs.existsSync(p.path));
+        } catch { return []; }
+      }).slice(0, 10)), // cap at 10 repos to avoid thrashing
       { path: path.join(h, "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"), app: "Apple Calendar" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlite"), app: "Reminders" },
       { path: path.join(h, "Library/Group Containers/group.com.apple.reminders/Reminders.sqlitedb"), app: "Reminders" },

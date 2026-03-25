@@ -129,6 +129,8 @@ const PII_PATTERNS: Array<[RegExp, string]> = [
   [/\b\+?44\s?\d{10}\b/g,                                      "[Phone]"],
   [/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g,            "[Card]"],
   [/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g,                "[IP]"],
+  [/\b(ghp_[a-zA-Z0-9]{36})\b/g,                             "[GH_TOKEN]"],
+  [/\b(sk-[a-zA-Z0-9]{48})\b/g,                              "[AI_API_KEY]"],
 ];
 
 export class Anonymiser {

@@ -240,7 +240,11 @@ const TASK_DESCRIPTIONS: Record<string, string> = {
 };
 
 class CloudTeacher {
-  constructor(private readonly apiKey?: string) {}
+  constructor(
+    private readonly apiKey?: string,
+    private readonly geminiKey?: string,
+    private readonly openaiKey?: string
+  ) {}
 
   async teachMethod(taskType: string): Promise<DistilledMethod | null> {
     if (!this.apiKey) return null;
@@ -312,6 +316,10 @@ export interface DistillationResult {
 export interface DistillationOptions {
   /** Anthropic API key — for teaching new methods. */
   apiKey?: string;
+  /** Google Gemini API key. */
+  geminiKey?: string;
+  /** OpenAI API key. */
+  openaiKey?: string;
   /** Ollama model name. Default: "llama3". */
   localModel?: string;
 }
@@ -324,7 +332,7 @@ export class DistillationEngine {
   constructor(opts: DistillationOptions = {}) {
     this.store   = new DistilStore();
     this.local   = new LocalReasoner(opts.localModel);
-    this.teacher = new CloudTeacher(opts.apiKey);
+    this.teacher = new CloudTeacher(opts.apiKey, opts.geminiKey, opts.openaiKey);
   }
 
   /**
@@ -409,8 +417,8 @@ export class DistillationEngine {
   } {
     return {
       distilledMethods:       this.store.stats(),
-      localModelAvailable:    "unknown", // async — call isLocalAvailable()
-      cloudTeacherConfigured: !!this.teacher["apiKey"],
+      localModelAvailable:    "unknown",
+      cloudTeacherConfigured: !!this.teacher["apiKey"] || !!this.teacher["geminiKey"],
     };
   }
 }
