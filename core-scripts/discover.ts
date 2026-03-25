@@ -80,7 +80,7 @@ interface AppTarget {
   category:         string;
 }
 
-const APP_TARGETS: AppTarget[] = [
+export const APP_TARGETS: AppTarget[] = [
   {
     name: "chrome", app: "Google Chrome", category: "browser",
     encryption: "chrome_aes",
@@ -178,7 +178,7 @@ const APP_TARGETS: AppTarget[] = [
 
 // ── Glob resolver — expands * to first matching path ─────────────────────────
 
-function resolveGlob(pattern: string): string | null {
+export function resolveGlob(pattern: string): string | null {
   const expanded = pattern.replace(/^~/, os.homedir());
   if (!expanded.includes("*")) {
     return fs.existsSync(expanded) ? expanded : null;
@@ -704,14 +704,6 @@ export class DiscoveryEngine {
 
       if (!filePath) {
         if (this.opts.verbose) console.log(`[LDP] skip (not found): ${target.app}`);
-        continue;
-      }
-
-      // Delta: skip if file unchanged since last read
-      const lastRead  = getLastReadAt(target.name);
-      const fileMtime = fs.statSync(filePath).mtimeMs / 1000;
-      if (!this.opts.forceRescan && lastRead > 0 && fileMtime <= lastRead) {
-        if (this.opts.verbose) console.log(`[LDP] skip (no changes): ${target.app}`);
         continue;
       }
 
