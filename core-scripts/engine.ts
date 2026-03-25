@@ -24,6 +24,10 @@ import {
   createMessage, ackMessage, errorMessage, isAck,
 } from "./types.js";
 import { LDPCrypto, getCrypto, LDP_DIR } from "./crypto.js";
+import { GovernedSession } from "./session.js";
+import { SessionMemoizer } from "./memoizer.js";
+import { DelegateRouter } from "./router.js";
+import { DelegationContract, PayloadMode } from "./types.js";
 
 // ── Schema Cache ──────────────────────────────────────────────────────────────
 
@@ -265,6 +269,8 @@ export class LDPEngine {
   readonly connectors = new Map<string, BaseConnector>();
   private connected   = new Set<string>();
   private approvalCb: ApprovalCallback | null;
+  private readonly memoizer = new SessionMemoizer();
+  private readonly router   = new DelegateRouter();
 
   readonly stats = {
     messages: 0, discovers: 0, reads: 0,
@@ -472,5 +478,12 @@ export class LDPEngine {
       registered: [...this.connectors.keys()],
       consented:  this.consent.listConsented(),
     };
+  }
+
+  /**
+   * Start a new governed session.
+   */
+  createGovernedSession(id: string, contract: DelegationContract, onAbort: (usage: any) => void): GovernedSession {
+    return new GovernedSession(id, contract, this.memoizer, this.router, onAbort);
   }
 }

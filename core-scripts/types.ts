@@ -27,6 +27,31 @@ export enum RiskTier {
   HIGH   = "HIGH",    // blocking confirmation required
 }
 
+export enum PayloadMode {
+  MODE_0 = 0, // Raw Text
+  MODE_1 = 1, // Structured JSON
+  MODE_2 = 2, // Semantic Context
+  MODE_3 = 3, // Semantic Graph
+}
+
+export interface NetworkUsage {
+  total_tokens: number;
+  usd_cost:     number;
+}
+
+export interface DelegationContract {
+  max_tokens:   number;
+  max_usd:       number;
+  fail_closed:   boolean;
+}
+
+export class ContractViolationError extends Error {
+  constructor(public readonly usage: NetworkUsage, message: string) {
+    super(message);
+    this.name = "ContractViolationError";
+  }
+}
+
 // ── Wire message — JSON-RPC 2.0 compatible ────────────────────────────────────
 
 export interface LDPMessage {
@@ -82,6 +107,15 @@ export interface ConnectorDescriptor {
     readonly pbkdf2Iter?: number;
     readonly ivFormat?: "spaces" | "hex";
   }>;
+  readonly identityCard?: IdentityCard;
+}
+
+export interface IdentityCard {
+  delegate_id:            string;
+  confidence_score:       number;
+  cryptographic_attestation?: string;
+  peer_verification_token?:   string;
+  capabilities:           string[];
 }
 
 export type SchemaMap = Record<string, Record<string, string>>;

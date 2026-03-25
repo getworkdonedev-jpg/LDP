@@ -149,6 +149,19 @@ This hybrid approach ensures that exact keyword matches (e.g., "find invoice 123
 
 The `MCPAdapter` wraps a running `LDPEngine` and exposes its connected sources as MCP-compatible tool definitions. This means any MCP client — Claude Desktop, Cursor, or any other — can use LDP sources without modification.
 
+### 3.5 Governed Sessions
+
+The `GovernedSession` is the enforcement layer of the LDP v2.2.0 architecture. It transitions the protocol from "trust-by-origin" to "governed-by-contract."
+
+#### 3.5.1 Strict Circuit Breaker
+The SDK monitors `total_tokens` and `usd_cost` in real-time. If a `DelegationContract` has `fail_closed: true` and any threshold is crossed, the SDK **immediately aborts** the underlying transport (Fetch/WebSocket) and throws a `ContractViolationError`.
+
+#### 3.5.2 Provenance Paradox Solver (Attestation Penalty)
+The `DelegateRouter` implements an **Attestation Penalty** to prevent unverified delegates from dominating search results. If a delegate reports a `confidence_score > 0.8` but lacks a `cryptographic_attestation`, its score is multiplied by **0.5**.
+
+#### 3.5.3 Negotiation Memoization
+To minimize latency during complex payload negotiations (e.g., Mode 3 Semantic Graph), the `SessionMemoizer` caches fallback events. If a delegate fails a high-mode negotiation twice, it is cached for **30 minutes**, forcing subsequent requests to default to Mode 1 (Structured JSON) instantly.
+
 ---
 
 ## 4. Wire Format
@@ -663,6 +676,12 @@ playback.read         media listening history
 - Privacy pipeline
 - Security requirements
 - Known app catalogue
+
+**v2.2.0** (March 2026)
+- Implemented Governed Model (Circuit Breaker, Delegate Router, Session Memoizer)
+- Integrated OpenTelemetry observability
+- Enhanced MCPAdapter for dynamic capability mapping
+- Upgraded keyword relevance to BM25
 
 ---
 
