@@ -31,3 +31,6 @@ mcp.json
 # Build Artifacts
 dist/
 out/
+brain_knowledge.json
+*.json.bak
+vault.json
