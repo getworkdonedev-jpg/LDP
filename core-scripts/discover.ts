@@ -36,6 +36,7 @@ import * as crypto        from "node:crypto";
 import { execSync }       from "node:child_process";
 import { createRequire }  from "node:module";
 import type { LDPEngine } from "./engine.js";
+import { VisionConnector } from "./vision.js";
 import type { BaseConnector, ConnectorDescriptor, Row, SchemaMap } from "./types.js";
 
 const require = createRequire(import.meta.url);
@@ -167,6 +168,11 @@ const APP_TARGETS: AppTarget[] = [
       darwin: ["~/Library/Application Support/Spotify/PersistentCache/podcasts.db"],
       linux:  ["~/.config/spotify/podcasts.db"],
     },
+  },
+  {
+    name: "vision", app: "Vision Bridge", category: "system",
+    encryption: "none",
+    globs: { darwin: ["/usr/sbin/screencapture"] },
   },
 ];
 
@@ -559,6 +565,8 @@ function buildConnector(discovered: {
   schema:     SchemaMap;
   confidence: number;
 }): BaseConnector {
+  if (discovered.name === "vision") return new VisionConnector();
+
   const descriptor: ConnectorDescriptor = {
     name:         discovered.name,
     app:          discovered.app,

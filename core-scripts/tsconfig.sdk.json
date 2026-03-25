@@ -21,8 +21,9 @@
     "chrome.ts", "signal.ts", "mcp.ts", "synthetic.ts",
     "auto-connector.ts", "main.ts", "index.ts",
     "discover.ts", "distill.ts", "privacy.ts", "pact.ts",
-    "rag.ts", "memory.ts", "agents.ts",
-    "brain.ts", "learned.ts", "scanner.ts"
+    "rag.ts", "memory.ts", "agents.ts", "archival.ts",
+    "brain.ts", "learned.ts", "scanner.ts", "vision.ts",
+    "new/pact.ts"
   ],
   "exclude": ["node_modules", "dist", "test-*.ts"]
 }

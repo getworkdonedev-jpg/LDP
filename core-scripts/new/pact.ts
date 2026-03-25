@@ -49,6 +49,10 @@ import { classifyTask }            from "../distill.js";
 import type { DistillationResult } from "../distill.js";
 import type { MCPContextPacket }   from "../privacy.js";
 import type { AgentState }         from "../agents.js";
+import type { 
+  ContextResult, Row, 
+  CitationsMap, ProvenanceInfo 
+} from "../types.js";
 
 // Dynamic imports keep startup fast — only load what each ask() needs
 async function getEngine()    { const { LDPEngine }         = await import("../engine.js");    return LDPEngine; }
@@ -92,6 +96,7 @@ export interface PACTAnswer {
   compressionRatio: number;
   confidence:    number;
   durationMs:    number;
+  provenance?:   CitationsMap;
 }
 
 // ── Internal state ────────────────────────────────────────────────────────────
@@ -213,19 +218,23 @@ export class PACT {
     const taskType = classifyTask(question);
     const isArchival = taskType === "cross_project_insight" || taskType === "cross_app_insight" || question.includes("history");
 
+    let archivalSummary: string | undefined;
     if (isArchival && opts.geminiKey) {
       if (opts.verbose) console.log("[PACT] Routing to Level 2 (Gemini Archival)...");
       const archivalResult = await this.state.archival.soulSearch(engine, question);
+      archivalSummary = archivalResult.summary;
       if (opts.verbose) console.log("[PACT] Archival Soul-Search complete.");
-      // We can inject the archival summary into the final answer logic
     }
 
     // ── Step 2: Read raw data (Targeted) ──────────────────────────────────────
-    let engineRows: Array<Record<string, unknown>> = [];
+    let engineRows: Row[] = [];
+    let contextResult: ContextResult | undefined;
+
     if (this.state.connected.length > 0) {
       const msg = await engine.query(question, this.state.connected);
       if (msg.type === "CONTEXT") {
-        engineRows = (msg.payload.chunks as Array<Record<string, unknown>>) ?? [];
+        contextResult = msg.payload as unknown as ContextResult;
+        engineRows    = (contextResult.chunks as Row[]) ?? [];
       }
     }
 
@@ -254,10 +263,20 @@ export class PACT {
     // ── Step 4: Distillation / Reasoning (Goal 2) ─────────────────────────────
     
     // Level 3: Claude Governance
-    const distillResult = await distill.answer(question, packet.compressedFacts);
+    const factsWithArchival = archivalSummary 
+      ? [...packet.compressedFacts, `[ARCHIVAL_GEMINI_SUMMARY] ${archivalSummary}`]
+      : packet.compressedFacts;
+
+    const distillResult = await distill.answer(question, factsWithArchival);
 
     const rawAnswer    = distillResult.answer;
     const finalAnswer  = rawAnswer ? privacy.deanonymise(rawAnswer) : null;
+    
+    // Level 4: Provenance Explorer
+    let provenance: CitationsMap | undefined;
+    if (finalAnswer && contextResult && (distillResult.cloudUsed || distillResult.mode === "distil_local")) {
+      provenance = ClaudeProvenanceRenderer.render(finalAnswer, contextResult);
+    }
 
     if (finalAnswer) {
       this.state.memory.addContext("assistant", finalAnswer);
@@ -278,6 +297,7 @@ export class PACT {
       compressionRatio: packet.compressionRatio,
       confidence:       agentState.confidence,
       durationMs:       Date.now() - t0,
+      provenance,
     };
   }
 
@@ -341,6 +361,31 @@ export class PACT {
    */
   stop(): void {
     this.state.engine.stop();
+  }
+}
+
+/**
+ * ClaudeProvenanceRenderer — link AI reasoning highlights to raw local facts.
+ */
+class ClaudeProvenanceRenderer {
+  static render(answer: string, context: ContextResult): CitationsMap {
+    const citations: CitationsMap = {};
+    const matches = answer.matchAll(/\[(\d+)\]/g);
+    
+    for (const match of matches) {
+      const index = parseInt(match[1], 10);
+      const source = context.citations?.[index - 1]; 
+      
+      if (source) {
+        citations[match[0]] = {
+          hash:    source.hash,
+          dbPath:  source.dbPath,
+          recency: source.recency,
+          snippet: JSON.stringify(context.chunks[source.originalIndex]).slice(0, 200)
+        };
+      }
+    }
+    return citations;
   }
 }
 

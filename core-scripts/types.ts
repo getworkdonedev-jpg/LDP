@@ -138,6 +138,15 @@ export interface BaseConnector {
   read(query: string, limit?: number): Promise<Row[]>;
 }
 
+export interface ProvenanceInfo {
+  hash:      string;
+  dbPath:    string;
+  recency:   number;
+  snippet:   string;
+}
+
+export type CitationsMap = Record<string, ProvenanceInfo>;
+
 // ── Context result ────────────────────────────────────────────────────────────
 
 export interface ContextResult {
@@ -150,6 +159,7 @@ export interface ContextResult {
   readonly citations?: Array<{
     hash: string;
     dbPath: string;
+    recency: number;
     originalIndex: number;
   }>;
 }

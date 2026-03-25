@@ -192,6 +192,7 @@ export class ContextPacker {
     const citations = packed.map((r, i) => ({
       hash: r._hash!,
       dbPath: r._dbPath!,
+      recency: (r._recency as number) ?? 0.5,
       originalIndex: i
     }));
 
