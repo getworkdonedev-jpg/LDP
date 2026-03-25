@@ -22,7 +22,7 @@
     "url": "git+https://github.com/ldp-protocol/ldp-js.git"
   },
   "license": "GPL-3.0",
-  "author": "Karthik Perumalla <your@email.com>",
+  "author": "Karthik Perumalla <karthikhub7@gmail.com>",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
