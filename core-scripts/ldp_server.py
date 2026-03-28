@@ -5,7 +5,7 @@ Reads: Chrome history, shell history, VS Code recent files,
        git log, terminal commands, any SQLite on your Mac.
 """
 
-LDP_VERSION = "1.1.0"
+LDP_VERSION = "3.0.0"
 
 import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform, glob, base64
 from pathlib import Path
