@@ -1,5 +1,5 @@
 /**
- * LDP — Auto Connector Generator v3.0.0
+ * LDP — Auto Connector Generator v3.1.0
  *
  * Scans the local machine for unknown SQLite / JSON databases,
  * reads their schemas, calls an LLM to infer meaning, and
@@ -181,6 +181,10 @@ const KNOWN_FINGERPRINTS: Array<{
     { pattern: /FaceTime\/.*\.db/i, app: "FaceTime", category: "messaging", permissions: ["calls.read"], namedQueries: { calls: "FaceTime call history" } },
     { pattern: /Maps\/.*\.db/i, app: "Apple Maps", category: "other", permissions: ["location.read"], namedQueries: { history: "Maps search history" } },
     { pattern: /podcasts\/.*\.sqlite/i, app: "Apple Podcasts", category: "media", permissions: ["media.read"], namedQueries: { play_history: "Podcast playback history" } },
+    { pattern: /Music\/.*\.musicdb|Music.*\.library/i, app: "Music", category: "media", permissions: ["media.read"], namedQueries: { library: "Music library and playlists" } },
+    { pattern: /iBooks\/.*BKLibrary.*\.sqlite/i, app: "Apple Books", category: "other", permissions: ["other.read"], namedQueries: { library: "E-books and PDF library" } },
+    { pattern: /Freeform\/.*\.sqlite/i, app: "Freeform", category: "notes", permissions: ["notes.read"], namedQueries: { boards: "Freeform digital whiteboards" } },
+    { pattern: /Discord\/.*\.db|discord.*\.log/i, app: "Discord", category: "messaging", permissions: ["messages.read"], namedQueries: { cache: "Discord interaction cache" } },
     { pattern: /stocks\/.*\.db/i, app: "Apple Stocks", category: "other", permissions: ["other.read"], namedQueries: { watchlist: "Stocks watchlist" } },
     { pattern: /weather\/.*\.db/i, app: "Apple Weather", category: "other", permissions: ["other.read"], namedQueries: { locations: "Saved weather locations" } },
     { pattern: /discord\/.*\.db/i, app: "Discord", category: "messaging", permissions: ["messages.read"], namedQueries: { servers: "Discord servers and channels" } },
@@ -190,6 +194,10 @@ const KNOWN_FINGERPRINTS: Array<{
     { pattern: /Microsoft\.Word\/.*\.db/i, app: "Microsoft Word", category: "notes", permissions: ["notes.read"], namedQueries: { recent: "Recent Word documents" } },
     { pattern: /whatsapp.*\.sqlite/i, app: "WhatsApp", category: "messaging", permissions: ["messages.read"], namedQueries: { chats: "WhatsApp chat list" } },
     { pattern: /\.ollama\/.*\.db/i, app: "Ollama", category: "developer", permissions: ["developer.read"], namedQueries: { history: "Ollama model interaction history" } },
+    { pattern: /Knowledge\/knowledgeC\.db/i, app: "Apple Screen Time & Usage", category: "system", permissions: ["system.read"], namedQueries: { usage: "App start/stop times and device state" } },
+    { pattern: /com\.apple\.TCC\/TCC\.db/i, app: "Apple Privacy Settings (TCC)", category: "system", permissions: ["system.read"], namedQueries: { permissions: "App privacy permissions audit (Camera, Mic, FDA)" } },
+    { pattern: /Photos Library\.photoslibrary\/database\/Photos\.sqlite/i, app: "Apple Photos", category: "media", permissions: ["media.read"], namedQueries: { metadata: "Photo metadata (Location, Date, People)" } },
+    { pattern: /powerlog\/.*\.db/i, app: "Apple Power & Battery Log", category: "system", permissions: ["system.read"], namedQueries: {} },
     {
       pattern: /Stickies\.db/i,
       app: "Apple Stickies",

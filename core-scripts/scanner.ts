@@ -1,5 +1,5 @@
 /**
- * LDP Full System Scanner v3.0.0
+ * LDP Full System Scanner v3.1.0
  * =======================
  * Scans the ENTIRE machine. Not just 15 known apps.
  *
@@ -145,7 +145,8 @@ const SKIP_PATH_PATTERNS = [
 
 const DATA_EXTS = new Set([
   ".db", ".sqlite", ".sqlite3", ".db3", ".vscdb", ".json", ".csv",
-  ".emlx", ".zsh_history", ".bash_history", ".plist"
+  ".emlx", ".zsh_history", ".bash_history", ".plist",
+  ".txt", ".md", ".py", ".js", ".ts", ".pdf", ".docx", ".doc"
 ]);
 
 // ── Scan roots ────────────────────────────────────────────────────────────────
@@ -224,7 +225,30 @@ function walk(
     }
   }
 
-  for (const r of roots) if (fs.existsSync(r)) recurse(r, 0);
+  for (const r of roots) {
+    if (fs.existsSync(r)) {
+      try {
+        recurse(r, 0); 
+      } catch (err) {
+        // Spotlight Fallback for TCC-protected directories like Desktop/Documents
+        if (r.includes("Desktop") || r.includes("Documents")) {
+          try {
+            const out = execSync(`mdfind -onlyin "${r}" "kMDItemFSName == '*.*'"`, { encoding: "utf-8" });
+            const files_md = out.split("\n").filter(Boolean);
+            for (const f of files_md) {
+              if (files >= max) break;
+              if (shouldSkip(path.basename(f), f)) continue;
+              const ext = path.extname(f).toLowerCase();
+              if (DATA_EXTS.has(ext)) {
+                 files++;
+                 cb(f, fs.statSync(f));
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+  }
   return { scannedFiles: files, scannedDirs: dirs };
 }
 
@@ -268,8 +292,19 @@ const PATH_SIGS: Array<{ pat: RegExp; app: string; cat: DataCategory; conf: numb
   { pat: /Spotify.*podcasts\.db/i,                               app:"Spotify",         cat:"media",      conf:0.95 },
   { pat: /healthdb_secure\.sqlite|HealthKit/i,                   app:"Apple Health",    cat:"health",     conf:0.95 },
   { pat: /Slack.*db$/i,                                          app:"Slack",           cat:"messaging",  conf:0.88 },
-  { pat: /Discord.*db$/i,                                        app:"Discord",         cat:"messaging",  conf:0.88 },
+  { pat: /Discord.*db$|discord\/.*\.log/i,                      app:"Discord",         cat:"messaging",  conf:0.88 },
   { pat: /Obsidian.*\.sqlite/i,                                  app:"Obsidian",        cat:"notes",      conf:0.88 },
+  { pat: /Music\/.*\.musicdb|Music\/.*\.library/i,              app:"Music",           cat:"media",      conf:0.95 },
+  { pat: /iBooks\/.*BKLibrary.*\.sqlite/i,                      app:"Apple Books",     cat:"other",      conf:0.95 },
+  { pat: /Freeform\/.*\.sqlite/i,                                app:"Freeform",        cat:"notes",      conf:0.95 },
+  { pat: /podcasts\/.*\.sqlite/i,                                app:"Apple Podcasts",  cat:"media",      conf:0.95 },
+  { pat: /GitHub Desktop\/.*\.db/i,                              app:"GitHub Desktop",  cat:"developer",  conf:0.95 },
+  { pat: /SAP.*CLI.*\.sqlite|SAP.*BTP.*\.db/i,                   app:"SAP CLI",         cat:"developer",  conf:0.98 },
+  { pat: /Workday.*\.doc|Workday.*\.pdf/i,                       app:"Workday Project", cat:"other",      conf:0.90 },
+  { pat: /Knowledge\/knowledgeC\.db/i,                           app:"Apple Screen Time",cat:"system",     conf:0.99 },
+  { pat: /com\.apple\.TCC\/TCC\.db/i,                           app:"Apple Privacy",    cat:"system",     conf:0.99 },
+  { pat: /Photos Library\.photoslibrary\/database\/Photos\.sqlite/i, app:"Apple Photos",     cat:"media",      conf:0.99 },
+  { pat: /powerlog\/.*\.db/i,                                   app:"Apple Power Log",  cat:"system",     conf:0.99 },
 ];
 
 function identifyFromPath(fp: string) {
@@ -373,6 +408,15 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, ap
     kb.learn({ appKey: `static_plist_${slug}`, appName: res.appName, filePath: fp, method: "plain_sqlite", category: "other", params: {}, schema: {}, confidence: 1.0 }, false);
     return res;
   }
+  if (fp.includes("/Desktop/") || fp.includes("/Documents/")) {
+    const isDoc = [".txt", ".md", ".py", ".js", ".ts", ".pdf", ".docx", ".doc"].some(e => fp.endsWith(e));
+    if (isDoc) {
+      const res = { ...base, appName:"Local Document", category:"other", confidence:0.8, staticMatch: "doc" as any } as ScannedFile;
+      const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
+      kb.learn({ appKey: `doc_${slug}`, appName: res.appName, filePath: fp, method: "plain_text" as any, category: "other", params: {}, schema: {}, confidence: 0.8 }, false);
+      return res;
+    }
+  }
 
   const pm = identifyFromPath(fp);
   const tables = (ft === "sqlite" || ft === "sqlcipher") ? readTables(fp) : [];
@@ -467,7 +511,8 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, ap
       const unknownName = `unknown_${folder}`.toLowerCase().replace(/[^a-z0-9_]/g, "_");
       const slug = path.basename(fp).toLowerCase().replace(/[^a-z0-9]/g,"_");
       const appKey = `${unknownName}_${slug}`;
-      if (!kb.lookup(fp)) {
+        // PII PROTECTION: Do not persist personal file paths (Desktop/Documents) to Brain
+        const isPII = fp.includes("/Desktop/") || fp.includes("/Documents/");
         kb.learn({
           appKey,
           appName: unknownName,
@@ -479,8 +524,7 @@ async function analyseFile(fp: string, stat: fs.Stats, ft: FileType, kb: any, ap
           confidence: ai.confidence,
           totalRows: density.total,
           maxRows: density.max
-        }, false);
-      }
+        }, !isPII);
       return { ...base, tables, appName: unknownName, category: "other", confidence: ai.confidence, totalRows: density.total, maxRows: density.max };
     }
   }

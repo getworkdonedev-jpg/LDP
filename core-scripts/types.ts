@@ -3,7 +3,7 @@
  * Core types. Wire format: JSON-RPC 2.0 (same as MCP).
  */
 
-export const LDP_VERSION = "1.0.0" as const;
+export const LDP_VERSION = "3.1.0" as const;
 
 // ── Message Types ─────────────────────────────────────────────────────────────
 

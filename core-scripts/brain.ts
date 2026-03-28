@@ -1,5 +1,5 @@
 /**
- * LDP Self-Learning Brain v3.0.0
+ * LDP Self-Learning Brain v3.1.0
  * =======================
  * Makes Signal-style manual debugging obsolete.
  *
@@ -27,7 +27,7 @@ const KNOWLEDGE_FILE = path.join(os.homedir(), "Desktop/LDP/core-scripts/brain_k
 export type DataCategory =
   | "messaging" | "browser" | "developer" | "health"
   | "finance"   | "notes"   | "media"     | "contacts"
-  | "calendar"  | "other";
+  | "calendar"  | "system"  | "other";
 
 export type DecryptMethod =
   | "plain_sqlite"
@@ -137,6 +137,7 @@ const CATEGORY_APPS: Record<DataCategory, string[]> = {
   media:      ["Spotify", "Apple Music"],
   contacts:   ["Apple Contacts"],
   calendar:   ["Apple Calendar", "Reminders"],
+  system:     ["Screen Time", "Privacy Settings", "Power Logs"],
   other:      ["unknown apps"],
 };
 
@@ -150,6 +151,7 @@ const CATEGORY_DESC: Record<DataCategory, string> = {
   media:      "Media history — Spotify listening, play counts",
   contacts:   "Contacts — names, phone numbers, email addresses",
   calendar:   "Calendar events and reminders",
+  system:     "System settings, privacy permissions, and device usage metrics",
   other:      "Other local app databases found on this machine",
 };
 

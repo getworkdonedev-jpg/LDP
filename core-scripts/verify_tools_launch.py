@@ -1,6 +1,10 @@
-import subprocess, json, sys, os
+import subprocess
+import json
+import sys
+import os
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-TOOLS_TO_TEST = [
+TOOLS_TO_TEST: List[str] = [
     "ldp_chrome_history_query",
     "ldp_imessage_query",
     "ldp_whatsapp_query",
@@ -13,7 +17,7 @@ TOOLS_TO_TEST = [
     "ldp_reminders_query"
 ]
 
-def run_tool(name, args={}):
+def run_tool(name: str, args: Dict[str, Any] = {}) -> Tuple[Optional[str], Optional[str]]:
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -24,54 +28,97 @@ def run_tool(name, args={}):
         }
     }
     input_str = json.dumps(payload) + "\n"
-    # Note: This assumes the server is not already running or we run it in a subprocess
-    process = subprocess.Popen(
-        ["python3", "ldp_server.py"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd="core-scripts"
-    )
-    # Give it a second to start (though main() reads line by line)
-    stdout, stderr = process.communicate(input=input_str, timeout=10)
-    return stdout, stderr
+    try:
+        process = subprocess.Popen(
+            ["python3", "ldp_server.py"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd="."
+        )
+        stdout, stderr = process.communicate(input=input_str, timeout=15)
+        return stdout, stderr
+    except Exception as e:
+        return None, str(e)
 
-def main():
+def main() -> None:
     print("Starting LDP Tool Verification...")
     for tool in TOOLS_TO_TEST:
         print(f"Testing {tool}...", end=" ", flush=True)
         try:
-            # We use limit=2 as requested
-            stdout, stderr = run_tool(tool, {"limit": 2})
-            if not stdout:
-                print(f"FAILED (No output). Stderr: {stderr}")
+            raw_stdout, raw_stderr = run_tool(tool, {"limit": 2})
+            
+            if raw_stdout is None:
+                err_str = str(raw_stderr or "Unknown spawn error")
+                print(f"FAILED (Spawn error). Stderr: {err_str}")
                 continue
             
-            # Find the JSON response in stdout (it might have some stderr-like junk at the start)
-            lines = stdout.strip().split("\n")
-            res_json = None
-            for line in lines:
+            stdout_str: str = raw_stdout
+            if not stdout_str.strip():
+                err_str = str(raw_stderr or "No output")
+                print(f"FAILED (No output). Stderr: {err_str}")
+                continue
+            
+            # Find the JSON response in stdout
+            res_json: Optional[Dict[str, Any]] = None
+            for line in stdout_str.strip().split("\n"):
                 if line.startswith('{"jsonrpc"'):
-                    res_json = json.loads(line)
-                    break
+                    try:
+                        parsed = json.loads(line)
+                        if isinstance(parsed, dict):
+                            res_json = cast(Dict[str, Any], parsed)
+                            break
+                    except json.JSONDecodeError:
+                        continue
             
-            if not res_json:
-                print(f"FAILED (No JSON response). Raw: {stdout[:100]}")
+            if res_json is None:
+                snippet = stdout_str[:50]
+                print(f"FAILED (No JSON response). Raw: {snippet}")
+                continue
+            
+            # Re-bind for Pyre narrowing
+            current_res: Dict[str, Any] = res_json
+            
+            # Check for JSON-RPC error
+            if "error" in current_res:
+                err_rpc = current_res.get("error")
+                print(f"FAILED (RPC Error). Error: {err_rpc}")
                 continue
                 
-            if "error" in res_json or res_json.get("result", {}).get("isError"):
-                print(f"FAILED (Error returned). Result: {res_json.get('result', {}).get('content')}")
+            result = current_res.get("result")
+            if not isinstance(result, dict):
+                print(f"FAILED (Malformed result). Result: {result}")
+                continue
+            
+            current_result: Dict[str, Any] = result
+            if current_result.get("isError"):
+                err_content = current_result.get("content")
+                print(f"FAILED (Tool-level error). Content: {err_content}")
                 continue
                 
-            content = res_json.get("result", {}).get("content", [{}])[0].get("text", "")
-            if not content or "No " in content or "Error" in content or "Not found" in content:
-                 print(f"FAILED (Empty or No-data message). Content: {content[:100]}")
+            content_list = current_result.get("content")
+            if not isinstance(content_list, list) or not content_list:
+                print("FAILED (Empty or malformed content list)")
+                continue
+
+            first_item = content_list[0]
+            if not isinstance(first_item, dict):
+                print("FAILED (Malformed content item)")
+                continue
+
+            # Ensure text is string before slicing
+            text_val = first_item.get("text")
+            content_text = str(text_val) if text_val is not None else ""
+            
+            if not content_text or any(x in content_text for x in ["No ", "Error", "Not found"]):
+                 snippet_text = content_text[:50]
+                 print(f"FAILED (No data). Content: {snippet_text}")
             else:
                  print("PASSED")
-                 # print(f"DEBUG Output: {content[:100]}...")
+                 
         except Exception as e:
-            print(f"ERROR: {e}")
+            print(f"ERROR in test loop: {e}")
 
 if __name__ == "__main__":
     main()

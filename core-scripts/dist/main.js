@@ -8,7 +8,7 @@ const [, , cmd, ...rest] = process.argv;
 async function start() {
     const { default: engine } = await import("./engine.js")
         .then(() => ({ default: new LDPEngine().start() }));
-    console.log("\n  \x1b[1mLDP — Local Data Protocol\x1b[0m v1.0.0");
+    console.log("\n  \x1b[1mLDP — Local Data Protocol\x1b[0m v3.1.0");
     console.log("  Local-first · AES-256-GCM · MIT\n");
     console.log("  Commands: connect <app> | query '<question>' | status | audit | list\n");
 }

@@ -21,7 +21,11 @@
 | Shell History | Terminal commands |
 | Git | Commits across all repos |
 | Reminders | All tasks |
-| Signal | Messages (consent required) |
+| Signal | Messages (Decrypted, Local-only) |
+| Discord | All messages (Canary/PTB supported) |
+| Apple Music | Playlists & Library (Universal) |
+| Career Docs | SAP, Workday, Resumes (PII-Shielded) |
+| Apple Maps | Navigation History (Heuristic Bridge) |
 | System Logs | All system logs |
 
 ## Install — 3 steps
@@ -81,8 +85,9 @@ Restart Claude Desktop. Done.
 
 - Zero data upload — ever
 - All processing on your Mac
-- Open source — verify every line
-- Audit log of every access at ~/.ldp/audit.log
+- **Privacy-First PII Shield**: Automatic scrubbing of personal paths/secrets from the brain.
+- **GitHub-Safe**: No personal details are stored in the codebase; uses generic discovery patterns.
+- Audit log of every access at `~/.ldp/audit.log`
 - Per-source consent — approve each app separately
 
 ## AI Teacher Cascade

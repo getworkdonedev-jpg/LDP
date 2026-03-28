@@ -494,9 +494,9 @@ DISCOVERED_EXPORTS: Dict[str, Any] = {}
 CATEGORY_MAP = {
     "browser":       ["chrome", "brave", "firefox", "safari", "edge", "arc"],
     "communication": ["signal", "whatsapp", "imessage", "telegram", "messages", "mail"],
-    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm", "calendar", "contacts", "reminders"],
-    "personal":      ["claude", "spotify", "notes", "animoji", "photos"],
-    "system":        ["shell", "dock", "system", "kernel", "drivefs", "tipkit", "coredatabackend"],
+    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm", "calendar", "contacts", "reminders", "fs", "file", "ls"],
+    "personal":      ["claude", "spotify", "notes", "animoji", "photos", "crm", "fused", "audit", "agent", "daily", "summary", "context", "search", "diagnostics", "health", "maps"],
+    "system":        ["shell", "dock", "system", "kernel", "drivefs", "tipkit", "coredatabackend", "permissions", "approvals", "active", "screen", "history", "discover"],
 }
 
 def classify_app(name_key: str) -> str:
@@ -1310,7 +1310,28 @@ def tool_whatsapp_query(args: dict) -> str:
 
 def tool_signal_query(args: dict) -> str:
     """Signal database handler (Encrypted - requires consent gate)."""
-    return "Signal database is protected by LDP Consent Gate. Decryption requires Signal passkey from local Keychain. Please use the LDP Dashboard to approve and unlock Signal data."
+    try:
+        query = args.get("query", "messages")
+        cmd = ["npx", "tsx", str(CORE_SCRIPTS / "decrypt-signal.ts"), query]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(CORE_SCRIPTS))
+        if r.returncode != 0:
+            return f"Signal decryption failed: {r.stderr or 'Check @signalapp/sqlcipher installation.'}"
+        
+        data = json.loads(r.stdout)
+        if isinstance(data, dict) and "error" in data:
+            return f"Signal Error: {data['error']}"
+            
+        # PII Shield the decrypted messages
+        out = []
+        for row in data[:20]: # Limit for performance
+            body = pii_shield(str(row.get("body", "")))
+            date = str(row.get("dateReceived", ""))
+            out.append(f"[{date}] {body}")
+        
+        if not out: return "No Signal messages found."
+        return "\n".join(out)
+    except Exception as e:
+        return f"Signal Query Error: {e}"
 
 def tool_telegram_query(args: dict) -> str:
     """Telegram database handler."""
@@ -1627,7 +1648,84 @@ def tool_diagnostics() -> str:
         "discovered_apps_count": len(DISCOVERED_APPS),
         "capabilities": ["Signal-SQLCipher", "iMessage-SmartQuery", "AppleNotes-Heuristic", "AppleMail-GmailProxy", "Dynamic-AutoConnect", "Global-Search", "FDA-Diagnostics"]
     }, indent=2)
+def tool_fs_list(dir_path: str = "") -> str:
+    """List contents of a directory (defaults to Home)."""
+    p = Path(os.path.expanduser(dir_path or "~")).resolve()
+    if not p.exists(): return f"Error: Path {p} not found"
+    if not p.is_dir(): return f"Error: {p} is not a directory"
+    try:
+        items = []
+        for x in p.iterdir():
+            suffix = "/" if x.is_dir() else ""
+            items.append(f"{x.name}{suffix}")
+        return "\n".join(sorted(items))
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+def tool_fs_read(file_path: str, limit_chars: int = 5000) -> str:
+    """Read a text file with PII shielding."""
+    p = Path(os.path.expanduser(file_path)).resolve()
+    if not p.exists(): return f"Error: File {p} not found"
+    if p.is_dir(): return f"Error: {p} is a directory, use ldp_fs_list instead"
+    try:
+        if p.stat().st_size > 5 * 1024 * 1024:
+            return "Error: File too large (>5MB). Please read a smaller slice if possible."
+        with open(p, "r", errors="ignore") as f:
+            content = f.read(limit_chars)
+        shielded = pii_shield(content)
+        prefix = "[PRIVACY_POLICY] forward_permission: false | expires_at: session_end\n---\n"
+        return prefix + shielded
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+def tool_fs_search(query: str) -> str:
+    """Search for files in the Brain Registry (brain_knowledge.json)."""
+    brain_path = Path(os.path.expanduser("~/.ldp/brain_knowledge.json"))
+    if not brain_path.exists():
+        return "Error: Brain Registry not found. Run 'ldp scan' first."
+    try:
+        with open(brain_path, "r") as f:
+            brain = json.load(f)
+        results = []
+        for s in brain.get("sources", []):
+            p = s.get("path", "")
+            if query.lower() in p.lower():
+                results.append(p)
+        for p, app in brain.get("path_map", {}).items():
+            if query.lower() in p.lower() or query.lower() in str(app).lower():
+                results.append(f"{p} ({app})")
+        if not results:
+            return f"No matches found for '{query}' in Brain Registry."
+        return "\n".join(sorted(list(set(results)))[:50])
+    except Exception as e:
+        return f"Error searching Brain Registry: {e}"
+
+def tool_fs_search_content(query: str, path_root: str = "~/Desktop") -> str:
+    """Search INSIDE text files for a query (optimized for Desktop)."""
+    root = Path(os.path.expanduser(path_root)).resolve()
+    if not root.exists(): return f"Error: {root} not found"
+    
+    results = []
+    # Use grep -r locally for speed
+    try:
+        # Limit to text-like extensions to avoid binary noise
+        cmd = ["grep", "-rIlE", "--include=*.{txt,md,py,js,ts,json,csv,log}", query, str(root)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            files = r.stdout.strip().split("\n")
+            for f in files[:20]: # Limit report
+                results.append(f)
+        
+        if not results:
+            return f"No file content matches found for '{query}' in {path_root}."
+        
+        return "Matches found in:\n" + "\n".join(results)
+    except Exception as e:
+        return f"Error searching content: {e}"
+
 def tool_daily_summary(args: dict) -> str:
+
+
     limit = args.get("limit", 20)
     out = ["=== LDP Daily Summary ==="]
     
@@ -1777,11 +1875,49 @@ def tool_fused_query(args: dict) -> str:
     for m in messages[-limit:]:
         out.append(f"[{m['source']}] {m['time_str']} | {m['sender']}: {m['text']}")
     return "\\n".join(out)
+    
+
+def tool_maps_history(args):
+    """Heuristic Maps Bridge: Gathers location context from multiple LDP sources."""
+    limit = args.get("limit", 20)
+    out = ["=== LDP Heuristic Maps Bridge ==="]
+    
+    # 1. Safari/Chrome Results
+    out.append("\\n[Navigation Intents (Browser)]")
+    try:
+        browser_data = tool_chrome_history(limit=50)
+        matches = [line for line in browser_data.split("\\n") if "maps" in line.lower()]
+        if matches: out.extend(matches[:limit])
+        else: out.append("No browser-based map intents found.")
+    except: pass
+
+    # 2. Calendar Locations
+    out.append("\\n[Calendar Destinations]")
+    try:
+        cal_data = tool_calendar_history(limit=50)
+        # Locations are often in the second half of the calendar line
+        matches = [line for line in cal_data.split("\\n") if "@" in line or "," in line]
+        if matches: out.extend(matches[:limit])
+        else: out.append("No clear calendar destinations found.")
+    except: pass
+    
+    # 3. Messaging Activity
+    out.append("\\n[Messaging Location Sharing]")
+    try:
+        # Check Signal for map links
+        signal_data = tool_signal_query({"query": "messages", "limit": 100})
+        matches = [m["body"] for m in json.loads(signal_data) if "maps.apple.com" in str(m.get("body","")).lower() or "google.com/maps" in str(m.get("body","")).lower()]
+        if matches: out.extend(matches[:limit])
+        else: out.append("No location shares found in messaging.")
+    except: pass
+    
+    return "\\n".join(out)
 
 
 # ── MCP Protocol ──────────────────────────────────────────────────
 
 ALL_STATIC_TOOLS = [
+    {"name": "ldp_maps_query", "description": "Heuristic Bridge for Apple Maps - gathers location context from Browser, Calendar, and Messaging.", "inputSchema": {"type":"object", "properties": {"limit": {"type": "integer"}}}},
     {"name": "ldp_daily_summary", "description": "Get a unified snapshot of the user's day (Chrome, iMessage, Calendar).", "inputSchema": {"type":"object", "properties": {"limit": {"type": "integer"}}}},
     {"name": "ldp_agent_action", "description": "Log an autonomous agent action to the user's personal audit trail.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string"}}}},
     {"name": "ldp_personal_crm", "description": "Query Apple Contacts and WhatsApp to extract a deduplicated list of people you know.", "inputSchema": {"type":"object", "properties": {}}},
@@ -1804,7 +1940,7 @@ ALL_STATIC_TOOLS = [
     {"name": "ldp_secure_action", "description": "Execute a secure action (e.g., order, send) using semantic tokens like {{ADDR_HOME}}. Raw PII is resolved locally and NEVER shared with AI models.", "inputSchema": {"type": "object", "properties": {"action_type": {"type": "string"}, "target_payload": {"type": "string"}}, "required": ["action_type", "target_payload"]}},
     {"name": "ldp_vision_scan", "description": "Capture screenshot of active window and OCR/analyze with GPT-4o Vision to index legacy apps.", "inputSchema": {"type": "object", "properties": {"app_name": {"type": "string", "description": "Name of the app to target (optional)"}}, "required": []}},
     {"name": "ldp_approve_action", "description": "Resume a tool execution that is PENDING_USER_APPROVAL. Requires a valid 8-char approval_token.", "inputSchema": {"type": "object", "properties": {"token": {"type": "string"}}, "required": ["token"]}},
-    {"name": "ldp_version", "description": "LDP v1.0.0 — Local Data Protocol", "inputSchema": {"type":"object"}},
+    {"name": "ldp_version", "description": "LDP v3.1.0 — Local Data Protocol", "inputSchema": {"type":"object"}},
     {"name": "ldp_chrome_history_query", "description": "Browse history (Chrome, Brave, Edge).", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
     {"name": "ldp_imessage_query", "description": "Read recent iMessage history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
     {"name": "ldp_whatsapp_query", "description": "Read recent WhatsApp history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
@@ -1815,6 +1951,10 @@ ALL_STATIC_TOOLS = [
     {"name": "ldp_git_log_query", "description": "Read git commit logs across repos.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
     {"name": "ldp_mail_query", "description": "Read local Apple Mail items.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
     {"name": "ldp_reminders_query", "description": "Read local Apple Reminders.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_fs_list", "description": "List contents of a local directory.", "inputSchema": {"type":"object", "properties": {"path": {"type":"string"}}}},
+    {"name": "ldp_fs_read", "description": "Read a local file with PII scrubbing.", "inputSchema": {"type":"object", "properties": {"path": {"type":"string"}, "limit":{"type":"integer"}}, "required": ["path"]}},
+    {"name": "ldp_fs_search", "description": "Search the local Brain Registry.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}, "required": ["query"]}},
+    {"name": "ldp_fs_search_content", "description": "Search INSIDE text files on your Desktop for a query.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}, "path": {"type":"string"}}}},
 ]
 
 TOOLS = []
@@ -1912,6 +2052,9 @@ def rebuild_tools():
         "ldp_secure_action": "system",
         "ldp_version": "system",
         "ldp_approve_action": "system",
+        "ldp_fs_list": "work",
+        "ldp_fs_read": "work",
+        "ldp_fs_search": "work",
     }
     
     # 1. Register base system tools
@@ -2337,6 +2480,18 @@ TOOL_MAP = {
     "ldp_git_log_query": lambda a: tool_query_app("git", limit=a.get("limit", 10)),
     "ldp_mail_query": lambda a: tool_query_app("mail", limit=a.get("limit", 10)),
     "ldp_reminders_query": lambda a: tool_query_app("reminders", limit=a.get("limit", 10)),
+    "ldp_fs_list": lambda a: tool_fs_list(a.get("path", "")),
+    "ldp_fs_read": lambda a: tool_fs_read(a.get("path", ""), a.get("limit", 5000)),
+    "ldp_fs_search": lambda a: tool_fs_search(a.get("query", "")),
+    "ldp_fs_search_content": lambda a: tool_fs_search_content(a.get("query", ""), a.get("path", "~/Desktop")),
+    "ldp_signal_query": lambda a: tool_signal_query(a),
+    "ldp_context_now": lambda a: tool_context_now(a),
+    "ldp_screen_today": lambda a: tool_screen_today(a),
+    "ldp_screen_history": lambda a: tool_screen_history(a),
+    "ldp_active_app": lambda a: tool_active_app(a),
+    "ldp_maps_query": lambda a: tool_maps_history(a),
+    "ldp_fused_whatsapp_query": lambda a: tool_fused_whatsapp_query(a),
+    "ldp_fused_context": lambda a: tool_fused_context(a),
 }
 
 # Ensure TOOL_MAP is typed correctly for the linter if needed

@@ -1,5 +1,5 @@
 /**
- * @ldp-protocol/sdk v3.0.0
+ * @ldp-protocol/sdk v3.1.0
  * ========================
  * LDP — Local Data Protocol
  * Privacy-first AI access to personal local data.
@@ -7,33 +7,28 @@
  * PACT = Personal AI Context Runtime (product built on this SDK)
  * LDP  = Local Data Protocol         (this open protocol)
  *
- * What's new in v2.0:
- *   - AgenticRAG   — two-model RAG (nomic-embed-code + nomic-embed-text)
- *   - MemoryEngine — 3-tier memory + CRDT team memory + intent prediction
- *   - SupervisorAgent — multi-agent routing (work/social/finance/calendar/health/web)
+ * What's new in v3.1.0:
+ *   - GovernedSession — circuit breaker, delegation contracts, attestation penalty
+ *   - SystemScanner   — full filesystem walk with AI teacher cascade
  *   - PrivacyEngine   — semantic compression → anonymise → differential privacy
  *   - DistillationEngine — Claude teaches Ollama, local runs forever
+ *   - OpenTelemetry observability for governed sessions
+ *   - Provenance citations on all query results
  *   - 9 bug fixes in engine, crypto, chrome, signal, mcp, synthetic
  *
  * @example Basic query
  * ```ts
- * import { LDPEngine, AgenticRAG, MemoryEngine } from "@ldp-protocol/sdk";
+ * import { LDPEngine } from "@ldp-protocol/sdk";
  * import { SyntheticChromeConnector } from "@ldp-protocol/sdk";
  *
  * const engine = new LDPEngine().start();
- * const rag    = new AgenticRAG();
- * const mem    = new MemoryEngine();
  *
  * engine.register(new SyntheticChromeConnector());
  * engine.grantConsent("chrome");
  * await engine.connect("chrome");
  *
- * const msg  = await engine.query("what sites did I visit most?");
- * const rows = msg.payload.raw?.chrome ?? [];
- * await rag.indexRows(rows, "chrome");
- *
- * const result = await rag.query("what sites did I waste time on?", ["chrome"]);
- * console.log(result.chunks[0].text);
+ * const msg = await engine.query("what sites did I visit most?");
+ * console.log(msg.payload);
  * ```
  *
  * @example With privacy for cloud AI
@@ -61,7 +56,8 @@
  * @see https://github.com/ldp-protocol/ldp-js
  */
 
-export const LDP_VERSION = "3.0.0" as const;
+// ── Version (single source of truth: types.ts) ──────────────────────────────
+export { LDP_VERSION } from "./types.js";
 
 // ── Core engine (v1 — unchanged public API + 4 bug fixes) ────────────────────
 export {

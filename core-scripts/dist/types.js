@@ -2,7 +2,7 @@
  * LDP — Local Data Protocol
  * Core types. Wire format: JSON-RPC 2.0 (same as MCP).
  */
-export const LDP_VERSION = "1.0.0";
+export const LDP_VERSION = "3.1.0";
 // ── Message Types ─────────────────────────────────────────────────────────────
 export var MsgType;
 (function (MsgType) {
