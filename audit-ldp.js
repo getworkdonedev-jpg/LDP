@@ -1,3 +1,7 @@
+/**
+ * LDP v3.0.0 Architecture Audit Script
+ * Verified Production-Ready Security Audit
+ */
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 

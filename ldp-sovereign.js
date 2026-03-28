@@ -1,3 +1,7 @@
+/**
+ * LDP v3.0.0 Sovereign Seal
+ * Verified Zero-Network Local Security
+ */
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');

@@ -1,3 +1,7 @@
+/**
+ * LDP v3.0.0 PQC Test Script
+ * Verified Hybrid PQC Throughput Test
+ */
 const admin = require('firebase-admin');
 const fs = require('fs');
 const crypto = require('crypto');

@@ -4,7 +4,7 @@
 > Privately. Automatically. Zero upload.
 
 [![npm](https://img.shields.io/npm/v/@ldp-protocol/sdk)](https://npmjs.com/package/@ldp-protocol/sdk)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 ## What LDP reads
 
@@ -109,11 +109,11 @@ Typical cost: $0.00
 ## Protocol spec
 LDP is an open standard.
 Build LDP for any platform:
-See spec/LDP_PROTOCOL_v1.md
+See spec/LDP_PROTOCOL_v3.md
 
 ## Support
 If LDP saves you time, star this repo.
 Commercial use: getworkdonedev@gmail.com
 
 ## License
-MIT — Karthik Perumalla 2026
+GPL-3.0 — Karthik Perumalla 2026

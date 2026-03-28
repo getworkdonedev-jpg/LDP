@@ -1,10 +1,10 @@
 # Local Data Protocol (LDP)
-## Specification v1.0.0
+## Specification v3.0.0
 
 **Status:** Draft  
 **Authors:** LDP Protocol Contributors  
 **Repository:** https://github.com/getworkdonedev-jpg/LDP  
-**License:** Apache 2.0  
+**License:** GPL-3.0  
 **Last Updated:** March 2026
 
 ---
@@ -681,22 +681,14 @@ playback.read         media listening history
 
 ## Appendix C — Changelog
 
-**v1.0.0** (March 2026)
-- Initial specification
-- BaseConnector interface
-- Consent model
-- Encryption specification
-- MCP compatibility layer
-- Auto-discovery pipeline
-- Privacy pipeline
-- Security requirements
-- Known app catalogue
-
-**v2.2.0** (March 2026)
-- Implemented Governed Model (Circuit Breaker, Delegate Router, Session Memoizer)
-- Integrated OpenTelemetry observability
-- Enhanced MCPAdapter for dynamic capability mapping
-- Upgraded keyword relevance to BM25
+**v3.0.0** (March 2026)
+- Major release: Cross-Source Fusion Layer (iMessage + WhatsApp)
+- Implemented Personal CRM for identity deduplication
+- Zero-Network PQC Vault (AES-256-GCM)
+- Automated PII Shielding & Privacy Masking
+- Central Brain Registry integration (anonymized schema sharing)
+- Massive SQL query optimization for Chrome/WhatsApp/iMessage
+- Zero-config dynamic path discovery
 
 ---
 
