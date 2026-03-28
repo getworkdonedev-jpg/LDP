@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import * as os from "node:os";
 import { SystemScanner } from "./scanner.js";
 import { KnowledgeBase } from "./brain.js";
 
@@ -5,7 +7,7 @@ async function run() {
   const kb = new KnowledgeBase();
   const scanner = new SystemScanner({ apiKey: "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", verbose: true });
 
-  const p = "/Users/karthikperumalla/Library/Group Containers/243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite";
+  const p = path.join(os.homedir(), "Library/Group Containers/243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite");
   const entry = kb.lookup(p);
   if (!entry) {
     console.log("No entry found!");

@@ -1,5 +1,5 @@
 /**
- * LDP — Auto Connector Generator
+ * LDP — Auto Connector Generator v3.0.0
  *
  * Scans the local machine for unknown SQLite / JSON databases,
  * reads their schemas, calls an LLM to infer meaning, and

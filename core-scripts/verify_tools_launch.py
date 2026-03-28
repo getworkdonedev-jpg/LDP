@@ -31,7 +31,7 @@ def run_tool(name, args={}):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd="/Users/karthikperumalla/Desktop/LDP/core-scripts"
+        cwd="core-scripts"
     )
     # Give it a second to start (though main() reads line by line)
     stdout, stderr = process.communicate(input=input_str, timeout=10)

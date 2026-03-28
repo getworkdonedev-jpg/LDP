@@ -1,5 +1,5 @@
 /**
- * LDP Full System Scanner
+ * LDP Full System Scanner v3.0.0
  * =======================
  * Scans the ENTIRE machine. Not just 15 known apps.
  *

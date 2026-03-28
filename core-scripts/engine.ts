@@ -1,5 +1,5 @@
 /**
- * LDP Engine — core runtime.
+ * LDP Engine v3.0.0 — core runtime.
  * Manages connectors, enforces consent, encrypts all state,
  * packs context, handles write intents, logs everything.
  *

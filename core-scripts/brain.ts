@@ -1,5 +1,5 @@
 /**
- * LDP Self-Learning Brain
+ * LDP Self-Learning Brain v3.0.0
  * =======================
  * Makes Signal-style manual debugging obsolete.
  *

@@ -1,10 +1,12 @@
+import * as path from "node:path";
+import * as os from "node:os";
 import { SystemScanner } from "./scanner.js";
 import { KnowledgeBase } from "./brain.js";
 import * as fs from "fs";
 
 async function run() {
   const kb = new KnowledgeBase();
-  const p = "/Users/karthikperumalla/Library/Group Containers/243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite";
+  const p = path.join(os.homedir(), "Library/Group Containers/243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite");
   const entry = kb.lookup(p);
   if (!entry) {
     console.log("No Apple Podcasts entry!");

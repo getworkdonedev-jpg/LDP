@@ -1,5 +1,5 @@
 /**
- * @ldp-protocol/sdk v2.0.0
+ * @ldp-protocol/sdk v3.0.0
  * ========================
  * LDP — Local Data Protocol
  * Privacy-first AI access to personal local data.
@@ -61,7 +61,7 @@
  * @see https://github.com/ldp-protocol/ldp-js
  */
 
-export const LDP_VERSION = "2.0.0" as const;
+export const LDP_VERSION = "3.0.0" as const;
 
 // ── Core engine (v1 — unchanged public API + 4 bug fixes) ────────────────────
 export {
