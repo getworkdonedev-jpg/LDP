@@ -174,6 +174,91 @@ export const APP_TARGETS: AppTarget[] = [
     encryption: "none",
     globs: { darwin: ["/usr/sbin/screencapture"] },
   },
+  {
+    name: "safari", app: "Safari", category: "browser",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Safari/History.db"] },
+  },
+  {
+    name: "apple_calendar", app: "Apple Calendar", category: "calendar",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Calendars/*.sqlite"] },
+  },
+  {
+    name: "apple_contacts", app: "Apple Contacts", category: "contacts",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/AddressBook/*.abcddb"] },
+  },
+  {
+    name: "apple_reminders", app: "Apple Reminders", category: "calendar",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Group Containers/group.com.apple.reminders/*.sqlite"] },
+  },
+  {
+    name: "apple_podcasts", app: "Apple Podcasts", category: "media",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Group Containers/group.com.apple.podcasts/*.sqlite"] },
+  },
+  {
+    name: "facetime", app: "FaceTime", category: "messaging",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/FaceTime/*.db"] },
+  },
+  {
+    name: "apple_maps", app: "Apple Maps", category: "other",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/Maps/*.db"] },
+  },
+  {
+    name: "apple_journal", app: "Apple Journal", category: "notes",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Group Containers/group.com.apple.journal/*.sqlite"] },
+  },
+  {
+    name: "discord", app: "Discord", category: "messaging",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/discord/databases/*.db", "~/Library/Application Support/discord/Local Storage/leveldb/*.ldb"] },
+  },
+  {
+    name: "github_desktop", app: "GitHub Desktop", category: "developer",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/GitHub Desktop/databases/*.db"] },
+  },
+  {
+    name: "microsoft_word", app: "Microsoft Word", category: "notes",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Containers/com.microsoft.Word/Data/Library/Application Support/Microsoft/Word/*.db"] },
+  },
+  {
+    name: "onedrive", app: "OneDrive", category: "other",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/OneDrive/settings/*.db"] },
+  },
+  {
+    name: "pycharm", app: "PyCharm", category: "developer",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Application Support/JetBrains/PyCharm*/**/*.db"] },
+  },
+  {
+    name: "whatsapp_v2", app: "WhatsApp", category: "messaging",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"] },
+  },
+  {
+    name: "apple_stocks", app: "Apple Stocks", category: "other",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Containers/com.apple.stocks/Data/Library/Application Support/*.db"] },
+  },
+  {
+    name: "apple_weather", app: "Apple Weather", category: "other",
+    encryption: "none",
+    globs: { darwin: ["~/Library/Containers/com.apple.weather/Data/Library/Application Support/*.db"] },
+  },
+  {
+    name: "ollama", app: "Ollama", category: "developer",
+    encryption: "none",
+    globs: { darwin: ["~/.ollama/history.db"] },
+  },
 ];
 
 // ── Glob resolver — expands * to first matching path ─────────────────────────

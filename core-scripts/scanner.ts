@@ -137,6 +137,10 @@ const SKIP_PATH_PATTERNS = [
   "Contents/Resources", "verified_contents.json", "WidevineCdm",
   "SolutionPackages", "ActorSafetyLists", "MC_43.10.2.11",
   ".app/Contents/", "plugin_config", "modules/discord_",
+  "Desktop/LDP", "brain_knowledge.json", "ldp_server.py",
+  "node_modules", ".git/objects", "dist/cjs", "dist/esm",
+  "cyberbotics", "webkinz", "webpquicklook", "website_audit", 
+  "website_watchman", "webstorm", "webtorrent", "webull"
 ];
 
 const DATA_EXTS = new Set([
@@ -919,6 +923,24 @@ export class SystemScanner {
     
     // Rule 6: Final commit of all learned knowledge
     if (learned && (learned as any).save) (learned as any).save();
+
+    // Extract public schema for Central Brain Registry
+    try {
+      const brainDir = path.join(os.homedir(), ".ldp");
+      const brainFile = path.join(brainDir, "brain_knowledge.json");
+      if (fs.existsSync(brainFile)) {
+        const data = JSON.parse(fs.readFileSync(brainFile, 'utf8'));
+        const safeData: Record<string, any> = {};
+        for (const [k, v] of Object.entries(data)) {
+          if (!k.startsWith('personal_')) safeData[k] = v;
+        }
+        const registryDir = path.join(os.homedir(), "Desktop/LDP/brain-registry");
+        if (!fs.existsSync(registryDir)) fs.mkdirSync(registryDir, { recursive: true });
+        fs.writeFileSync(path.join(registryDir, "schema.json"), JSON.stringify(safeData, null, 2));
+      }
+    } catch (e) {
+      if (this.opts.verbose) console.error("[SCAN] Failed to sync brain registry:", e);
+    }
 
     result.durationMs = Date.now() - t0;
 

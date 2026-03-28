@@ -1,6 +1,8 @@
 import json
 import subprocess
 import os
+import typing
+from typing import Any
 
 TOOLS_TO_TEST = [
     "ldp_chrome_history_query",
@@ -63,6 +65,6 @@ for tool in TOOLS_TO_TEST:
             continue
     
     if not found_resp:
-        print(f"  ❓ NO RESPONSE. Stderr: {stderr[:200]}")
+        print(f"  ❓ NO RESPONSE. Stderr: {typing.cast(Any, str(stderr))[0:200]}")
 
 print("=== End of Verification ===")

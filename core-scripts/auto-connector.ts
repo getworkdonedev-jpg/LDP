@@ -36,6 +36,16 @@ export interface AutoGenOptions {
   skipPatterns?: string[];
   /** Model to use for schema analysis (default: claude-haiku-4-5-20251001 — fast + cheap). */
   model?: string;
+  /** If true, includes databases with very low row counts (< 10). */
+  showLowPriority?: boolean;
+  /** Max directory depth to scan (default 6). */
+  maxDepth?: number;
+  /** If true, returns all discovered instances, even for the same app. */
+  allowDuplicates?: boolean;
+  /** If true, includes caches and system preferences. */
+  fullExhaustive?: boolean;
+  /** If true, returns results even with very low confidence scores. */
+  allowLowConfidence?: boolean;
 }
 
 export interface AutoGenResult {
@@ -168,25 +178,35 @@ const KNOWN_FINGERPRINTS: Array<{
         recent_notes: "Notes modified in last 7 days",
       },
     },
+    { pattern: /FaceTime\/.*\.db/i, app: "FaceTime", category: "messaging", permissions: ["calls.read"], namedQueries: { calls: "FaceTime call history" } },
+    { pattern: /Maps\/.*\.db/i, app: "Apple Maps", category: "other", permissions: ["location.read"], namedQueries: { history: "Maps search history" } },
+    { pattern: /podcasts\/.*\.sqlite/i, app: "Apple Podcasts", category: "media", permissions: ["media.read"], namedQueries: { play_history: "Podcast playback history" } },
+    { pattern: /stocks\/.*\.db/i, app: "Apple Stocks", category: "other", permissions: ["other.read"], namedQueries: { watchlist: "Stocks watchlist" } },
+    { pattern: /weather\/.*\.db/i, app: "Apple Weather", category: "other", permissions: ["other.read"], namedQueries: { locations: "Saved weather locations" } },
+    { pattern: /discord\/.*\.db/i, app: "Discord", category: "messaging", permissions: ["messages.read"], namedQueries: { servers: "Discord servers and channels" } },
+    { pattern: /GitHub Desktop\/.*\.db/i, app: "GitHub Desktop", category: "developer", permissions: ["developer.read"], namedQueries: { repos: "Local git repositories" } },
+    { pattern: /OneDrive\/.*\.db/i, app: "OneDrive", category: "other", permissions: ["other.read"], namedQueries: { files: "OneDrive synced files" } },
+    { pattern: /PyCharm.*\.db/i, app: "PyCharm", category: "developer", permissions: ["developer.read"], namedQueries: { projects: "PyCharm project history" } },
+    { pattern: /Microsoft\.Word\/.*\.db/i, app: "Microsoft Word", category: "notes", permissions: ["notes.read"], namedQueries: { recent: "Recent Word documents" } },
+    { pattern: /whatsapp.*\.sqlite/i, app: "WhatsApp", category: "messaging", permissions: ["messages.read"], namedQueries: { chats: "WhatsApp chat list" } },
+    { pattern: /\.ollama\/.*\.db/i, app: "Ollama", category: "developer", permissions: ["developer.read"], namedQueries: { history: "Ollama model interaction history" } },
     {
-      pattern: /Stickies\.sqlite/i,
-      app: "Stickies",
+      pattern: /Stickies\.db/i,
+      app: "Apple Stickies",
       category: "notes",
       permissions: ["notes.read"],
-      namedQueries: {
-        all_stickies: "Content of all desktop sticky notes",
-      },
+      namedQueries: { all_stickies: "Content of all desktop sticky notes" },
     },
   ];
 
 // ── Default scan paths per platform ──────────────────────────────────────────
 
-function defaultScanPaths(): string[] {
+function defaultScanPaths(exhaustive = false): string[] {
   const home = os.homedir();
   const plat = process.platform;
 
   if (plat === "darwin") {
-    return [
+    const paths = [
       path.join(home, "Library", "Application Support"),
       path.join(home, "Library", "Containers"),
       path.join(home, "Library", "Group Containers"),
@@ -199,6 +219,13 @@ function defaultScanPaths(): string[] {
       path.join(home, ".config"),
       path.join(home, ".local", "share"),
     ];
+    if (exhaustive) {
+      const lib = path.join(home, "Library");
+      paths.push(path.join(lib, "Caches"));
+      paths.push(path.join(lib, "Preferences"));
+      paths.push(path.join(lib, "Saved Application State"));
+    }
+    return paths;
   }
 
   if (plat === "win32") {
@@ -319,13 +346,15 @@ function getDatabaseDensity(filePath: string, tableNames: string[]): { total: nu
 function scanForDatabases(
   roots: string[],
   skipPatterns: string[],
-  maxFiles: number
+  maxFiles: number,
+  maxDepth = 6,
+  exhaustive = false
 ): string[] {
   const found: string[] = [];
   const visited = new Set<string>();
 
   function walk(dir: string, depth: number) {
-    if (depth > 6 || found.length >= maxFiles) return;
+    if (depth > maxDepth || found.length >= maxFiles) return;
     if (visited.has(dir)) return;
     visited.add(dir);
 
@@ -341,14 +370,14 @@ function scanForDatabases(
 
       // Skip system/cache dirs
       if (entry.isDirectory()) {
-        if (skipPatterns.some(p => entry.name.includes(p))) continue;
+        if (!exhaustive && skipPatterns.some(p => entry.name.includes(p))) continue;
         walk(fullPath, depth + 1);
         continue;
       }
 
       // SQLite files
       if (entry.isFile()) {
-        if (skipPatterns.some(p => fullPath.includes(p))) continue;
+        if (!exhaustive && skipPatterns.some(p => fullPath.includes(p))) continue;
         if (
           lname.endsWith(".db") ||
           lname.endsWith(".sqlite") ||
@@ -570,6 +599,11 @@ export class AutoConnectorGenerator {
       maxFiles: opts.maxFiles ?? 200,
       skipPatterns: opts.skipPatterns ?? DEFAULT_SKIP,
       model: opts.model ?? "claude-haiku-4-5-20251001",
+      showLowPriority: opts.showLowPriority ?? false,
+      maxDepth: opts.maxDepth ?? 6,
+      allowDuplicates: opts.allowDuplicates ?? false,
+      fullExhaustive: opts.fullExhaustive ?? false,
+      allowLowConfidence: opts.allowLowConfidence ?? false,
     };
   }
 
@@ -578,8 +612,8 @@ export class AutoConnectorGenerator {
    * Already-known apps use heuristics (instant). Unknown ones call the AI.
    */
   async scan(): Promise<AutoGenResult[]> {
-    const scanPaths = [...defaultScanPaths(), ...this.opts.extraPaths];
-    const dbFiles = scanForDatabases(scanPaths, this.opts.skipPatterns, this.opts.maxFiles);
+    const scanPaths = [...defaultScanPaths(this.opts.fullExhaustive), ...this.opts.extraPaths];
+    const dbFiles = scanForDatabases(scanPaths, this.opts.skipPatterns, this.opts.maxFiles, this.opts.maxDepth, this.opts.fullExhaustive);
 
     const results: AutoGenResult[] = [];
     const seen = new Set<string>(); // deduplicate by app name
@@ -605,13 +639,13 @@ export class AutoConnectorGenerator {
         const isLowPriority = totalRows < 10;
         const canAutoRegister = maxRows > 10 || isWhitelisted;
 
-        if (isLowPriority && !isWhitelisted) {
+        if (isLowPriority && !isWhitelisted && !this.opts.showLowPriority) {
           console.warn(`[LDP AutoGen] Low priority database skipped: ${result.descriptor.app} (${totalRows} rows)`);
           continue; 
         }
 
-        if (result.confidence < 0.3) continue; // skip very uncertain
-        if (seen.has(result.descriptor.app)) continue; // one connector per app
+        if (result.confidence < 0.3 && !this.opts.allowLowConfidence) continue; // skip very uncertain
+        if (seen.has(result.descriptor.app) && !this.opts.allowDuplicates) continue; // one connector per app
         seen.add(result.descriptor.app);
         results.push(result);
       } catch {
@@ -713,15 +747,26 @@ export class AutoConnectorGenerator {
         description: heuristic.description,
         connectionHints: hints as any
       };
+    }
+    if (this.opts.fullExhaustive) {
+      const descriptor: ConnectorDescriptor = {
+        name: `unknown_${path.basename(filePath).toLowerCase().replace(/[\s.]+/g, "_")}`,
+        app: `Unknown (${path.basename(filePath)})`,
+        version: "auto-1.0",
+        dataPaths: [filePath],
+        permissions: ["other.read"],
+        namedQueries: { all: "Query all records" },
+        description: `Unidentified SQLite database at ${filePath}`,
+        connectionHints: hints as any
+      };
       return {
         descriptor,
         connector: buildConnector(descriptor, filePath),
-        confidence: heuristic.confidence,
+        confidence: 0.1,
         sourcePath: filePath,
         method: "heuristic",
       };
     }
-
     return null;
   }
 

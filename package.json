@@ -1,0 +1,21 @@
+{
+  "name": "ldp",
+  "version": "1.0.0",
+  "description": "> Give any AI complete awareness of your Mac. > Privately. Automatically. Zero upload.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getworkdonedev-jpg/LDP.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/getworkdonedev-jpg/LDP/issues"
+  },
+  "homepage": "https://github.com/getworkdonedev-jpg/LDP#readme"
+}

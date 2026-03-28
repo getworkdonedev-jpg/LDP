@@ -1,4 +1,6 @@
-import ldp_server
+import os, sys
+sys.path.append(os.path.dirname(__file__))
+import ldp_server # type: ignore
 import json
 
 print("\n--- Testing ldp_fused_whatsapp_query ---")

@@ -102,6 +102,24 @@ export class MCPAdapter {
         };
         return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
     }
+    /**
+     * Ingest an Anthropic MCP list_tools response and map to LDP capabilities.
+     */
+    ingestMCPTools(mcpListToolsResponse) {
+        const tools = mcpListToolsResponse.tools || [];
+        return tools.map((t) => `mcp:${t.name}`);
+    }
+    /**
+     * Generate an Identity Card for a delegate.
+     */
+    generateIdentityCard(delegate_id, mcpTools, confidence = 1.0, attestation) {
+        return {
+            delegate_id,
+            confidence_score: confidence,
+            cryptographic_attestation: attestation,
+            capabilities: this.ingestMCPTools(mcpTools),
+        };
+    }
 }
 // ── SECURITY: Secure MCP server factory ──────────────────────────────────────
 // CRITICAL (1000-team finding): MCP server MUST bind to 127.0.0.1 only.

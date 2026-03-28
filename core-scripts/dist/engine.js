@@ -15,8 +15,12 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { MsgType, RiskTier, createMessage, ackMessage, errorMessage, } from "./types.js";
 import { getCrypto, LDP_DIR } from "./crypto.js";
+import { GovernedSession } from "./session.js";
+import { SessionMemoizer } from "./memoizer.js";
+import { DelegateRouter } from "./router.js";
 // ── Schema Cache ──────────────────────────────────────────────────────────────
 export class SchemaCache {
     file;
@@ -71,10 +75,14 @@ export class ConsentStore {
 }
 // ── Context Packer ────────────────────────────────────────────────────────────
 export class ContextPacker {
+    connectors;
     budget;
     k1 = 1.2;
     b = 0.75;
-    constructor(tokenBudget = 8_000) { this.budget = tokenBudget; }
+    constructor(connectors, tokenBudget = 8_000) {
+        this.connectors = connectors;
+        this.budget = tokenBudget;
+    }
     /**
      * BM25 relevance scoring.
      * score(D, Q) = Σ [ IDF(q_i) * (f(q_i, D) * (k1 + 1)) / (f(q_i, D) + k1 * (1 - b + b * (|D| / avgdl))) ]
@@ -82,8 +90,17 @@ export class ContextPacker {
     pack(sources, query) {
         const allRows = [];
         for (const [src, rows] of Object.entries(sources)) {
+            const connector = this.connectors?.get(src);
+            const dbPath = connector?.dbPath ?? "local_db";
             for (const row of rows) {
-                allRows.push({ ...row, _src: src });
+                const rawContent = JSON.stringify(row);
+                const hash = crypto.createHash("sha256").update(rawContent).digest("hex");
+                allRows.push({
+                    ...row,
+                    _src: src,
+                    _hash: hash,
+                    _dbPath: dbPath
+                });
             }
         }
         const qWords = query.toLowerCase().split(/\s+/).filter(Boolean);
@@ -134,14 +151,21 @@ export class ContextPacker {
         for (const [, row] of scored) {
             const t = Math.floor(JSON.stringify(row).length / 4);
             if (tokens + t > this.budget)
-                break;
+                break; // was: activeBudget (undefined ReferenceError)
             packed.push(row);
             tokens += t;
         }
         const totalRows = Object.values(sources).reduce((s, r) => s + r.length, 0);
+        const citations = packed.map((r, i) => ({
+            hash: r._hash,
+            dbPath: r._dbPath,
+            recency: r._recency ?? 0.5,
+            originalIndex: i
+        }));
         return {
             query, chunks: packed, tokensUsed: tokens,
             sources: Object.keys(sources), totalRows, packedRows: packed.length,
+            citations
         };
     }
 }
@@ -206,12 +230,15 @@ export class LDPEngine {
     cache;
     consent;
     packer;
+    budget;
     audit;
     // FIX HIGH-04: connectors is now public readonly so MCPAdapter
     // can access it without the unsafe (this.engine as any) cast.
     connectors = new Map();
     connected = new Set();
     approvalCb;
+    memoizer = new SessionMemoizer();
+    router = new DelegateRouter();
     stats = {
         messages: 0, discovers: 0, reads: 0,
         cacheHits: 0, cacheMisses: 0,
@@ -221,12 +248,13 @@ export class LDPEngine {
     };
     constructor(opts = {}) {
         this.dataDir = opts.dataDir ?? LDP_DIR;
+        this.budget = opts.tokenBudget ?? 8_000;
         this.approvalCb = opts.approvalCb ?? null;
         fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
         this.cache = new SchemaCache(path.join(this.dataDir, "schema_cache.enc"));
         this.consent = new ConsentStore(path.join(this.dataDir, "consent.enc"));
         this.audit = new AuditLog(path.join(this.dataDir, "audit.enc"));
-        this.packer = new ContextPacker(opts.tokenBudget);
+        this.packer = new ContextPacker(this.connectors, this.budget);
     }
     start() { this.audit.start(); return this; }
     stop() { this.audit.stop(); }
@@ -320,7 +348,8 @@ export class LDPEngine {
             cache: cached ? "hit" : "mapped" });
     }
     // ── Query ─────────────────────────────────────────────────────────────────
-    async query(question, sources) {
+    async query(question, sources = ["*"], opts = {}) {
+        const activeBudget = opts.budget ?? this.budget;
         const targets = sources ?? [...this.connected];
         if (!targets.length)
             return errorMessage("No connected sources");
@@ -391,6 +420,36 @@ export class LDPEngine {
             registered: [...this.connectors.keys()],
             consented: this.consent.listConsented(),
         };
+    }
+    /**
+     * Verify that the LLM response has at least 70% semantic overlap with the retrieved context.
+     * Simple implementation: checks for presence of key terms/phrases from snippets.
+     */
+    verifyResponse(response, context) {
+        const snippets = context.chunks.map(c => JSON.stringify(c).toLowerCase());
+        const respLower = response.toLowerCase();
+        // We break the response into words and check how many exist in the snippets
+        const respWords = response.toLowerCase().split(/\W+/).filter(w => w.length > 3);
+        if (respWords.length === 0)
+            return { valid: true, overlap: 1.0, citationsFound: 0 };
+        let found = 0;
+        const snippetText = snippets.join(" ");
+        for (const word of respWords) {
+            if (snippetText.includes(word))
+                found++;
+        }
+        const overlap = found / respWords.length;
+        return {
+            valid: overlap >= 0.7,
+            overlap,
+            citationsFound: found
+        };
+    }
+    /**
+     * Start a new governed session.
+     */
+    createGovernedSession(id, contract, onAbort) {
+        return new GovernedSession(id, contract, this.memoizer, this.router, onAbort);
     }
 }
 //# sourceMappingURL=engine.js.map

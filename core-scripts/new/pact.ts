@@ -367,7 +367,7 @@ export class PACT {
 /**
  * ClaudeProvenanceRenderer — link AI reasoning highlights to raw local facts.
  */
-class ClaudeProvenanceRenderer {
+export class ClaudeProvenanceRenderer {
   static render(answer: string, context: ContextResult): CitationsMap {
     const citations: CitationsMap = {};
     const matches = answer.matchAll(/\[(\d+)\]/g);

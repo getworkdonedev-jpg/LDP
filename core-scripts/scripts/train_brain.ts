@@ -77,7 +77,7 @@ async function sourceGitHub() {
 
   for (const repo of REPOS) {
     try {
-      const headers = GITHUB_TOKEN ? { "Authorization": `Bearer ${GITHUB_TOKEN}` } : {};
+      const headers: HeadersInit = GITHUB_TOKEN ? { "Authorization": `Bearer ${GITHUB_TOKEN}` } : {};
       const res = await fetch(`https://api.github.com/repos/${repo}/git/trees/HEAD?recursive=1`, { headers });
       if (!res.ok) continue;
       const data = await res.json() as any;
@@ -129,7 +129,7 @@ async function sourceStackOverflow() {
       for (const item of (data.items || [])) {
         const body = item.body || "";
         const matches = Array.from(body.matchAll(/\b([A-Z][A-Z_]{2,})\b/g));
-        matches.forEach(m => app.tableSignature.add(m[1]));
+        matches.forEach((m: any) => app.tableSignature.add(m[1]));
       }
     } catch { continue; }
   }

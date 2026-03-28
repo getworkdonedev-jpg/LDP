@@ -80,10 +80,10 @@ export class ChromeConnector implements BaseConnector {
     description: "Chrome browsing history — stays on your device.",
   };
 
-  private dbPath: string | null = null;
+  dbPath: string | undefined = undefined;
 
   async discover(): Promise<boolean> {
-    this.dbPath = findFirst(this.descriptor.dataPaths);
+    this.dbPath = findFirst(this.descriptor.dataPaths) || undefined;
     return this.dbPath !== null;
   }
 

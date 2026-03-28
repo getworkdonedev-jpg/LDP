@@ -5,6 +5,8 @@ Reads: Chrome history, shell history, VS Code recent files,
        git log, terminal commands, any SQLite on your Mac.
 """
 
+LDP_VERSION = "1.1.0"
+
 import sqlite3, shutil, os, json, sys, tempfile, subprocess, platform, glob, base64
 from pathlib import Path
 from datetime import datetime, timezone
@@ -23,6 +25,111 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 from collections import deque
+
+import re, base64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# ── PII SHIELD ──────────────────────────────────────────────────
+PII_PATTERNS = {
+    'CARD':    r'\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b',
+    'SSN':     r'\b\d{3}-\d{2}-\d{4}\b',
+    'API_KEY': r'\b(sk-|sk_live_|ghp_|AIza)[A-Za-z0-9_\-]{20,}\b',
+    'PASSWD':  r'(?i)(password|passwd|pwd)\s*[:=]\s*\S+',
+    'BANK':    r'\b\d{8,17}\b',
+    'ROUTING': r'\b\d{9}\b'
+}
+
+_TOKEN_MAP = {}
+_TOKEN_COUNTER = [0]
+
+def pii_shield(text: str) -> str:
+    result = text
+    for label, pattern in PII_PATTERNS.items():
+        for match in re.findall(pattern, result):
+            _TOKEN_COUNTER[0] += 1
+            token = f"{{{{PII_{label}_{_TOKEN_COUNTER[0]:03d}}}}}"
+            _TOKEN_MAP[token] = match
+            result = result.replace(match, token, 1)
+    return result
+
+def pii_resolve(token: str) -> str:
+    return _TOKEN_MAP.get(token, token)
+
+# ── AES-256-GCM VAULT ───────────────────────────────────────────
+VAULT_PATH = os.path.expanduser('~/.ldp/vault.json')
+_VAULT_KEY = None
+
+def _get_vault_key() -> bytes:
+    global _VAULT_KEY
+    if _VAULT_KEY is not None:
+        return _VAULT_KEY
+    r = subprocess.run(
+        ['security', 'find-generic-password', '-s', 'LDP-Vault-Key', '-w'],
+        capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        _VAULT_KEY = bytes.fromhex(r.stdout.strip())
+    else:
+        _VAULT_KEY = os.urandom(32)
+        subprocess.run([
+            'security', 'add-generic-password',
+            '-s', 'LDP-Vault-Key', '-a', 'ldp',
+            '-w', _VAULT_KEY.hex()
+        ], capture_output=True)
+    return _VAULT_KEY
+
+def vault_write(key: str, data: dict) -> None:
+    aesgcm = AESGCM(_get_vault_key())
+    nonce  = os.urandom(12)
+    ct     = aesgcm.encrypt(nonce, json.dumps(data).encode(), None)
+    vault  = {}
+    if os.path.exists(VAULT_PATH):
+        try:
+            with open(VAULT_PATH) as f:
+                vault = json.load(f)
+        except: pass
+    vault[key] = {
+        'header': 'LDP-PQC-V1:AES-256-GCM',
+        'nonce':  base64.b64encode(nonce).decode(),
+        'ct':     base64.b64encode(ct).decode()
+    }
+    os.makedirs(os.path.dirname(VAULT_PATH), exist_ok=True)
+    tmp = VAULT_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(vault, f, indent=2)
+    os.rename(tmp, VAULT_PATH)
+
+def vault_read(key: str) -> Optional[dict]:
+    if not os.path.exists(VAULT_PATH):
+        return None
+    try:
+        with open(VAULT_PATH) as f:
+            vault = json.load(f)
+        if key not in vault:
+            return None
+        entry  = vault[key]
+        aesgcm = AESGCM(_get_vault_key())
+        nonce  = base64.b64decode(entry['nonce'])
+        ct     = base64.b64decode(entry['ct'])
+        return json.loads(aesgcm.decrypt(nonce, ct, None))
+    except: return None
+
+# ── AUDIT LOG ───────────────────────────────────────────────────
+AUDIT_PATH = os.path.expanduser('~/.ldp/audit.log')
+
+def audit_log(tool_name: str, row_count: int) -> None:
+    from datetime import datetime
+    line = f"{datetime.now().isoformat()} | tool={tool_name} | rows={row_count}\\n"
+    with open(AUDIT_PATH, 'a') as f:
+        f.write(line)
+
+def tool_audit_log(args):
+    limit = args.get('limit', 20)
+    if not os.path.exists(AUDIT_PATH):
+        return "No audit log yet."
+    with open(AUDIT_PATH) as f:
+        lines = f.readlines()
+    return ''.join(lines[-limit:])
 
 if not CORE_SCRIPTS.exists():
     CORE_SCRIPTS = SCRIPT_DIR / "core-scripts"
@@ -78,7 +185,7 @@ class LDPSecurityEnforcer:
             AGENT_TRUST_FILE.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with open(AGENT_TRUST_FILE, "w") as f:
-                    json.dump({"agents": [{"id": "claude-desktop", "allowed_categories": ["personal", "work", "finance", "browser", "system"]}], "default_policy": "deny"}, f, indent=2)
+                    json.dump({"agents": [{"id": "claude-desktop", "allowed_categories": ["personal", "work", "finance", "browser", "system", "communication"]}], "default_policy": "deny"}, f, indent=2)
             except: pass
         try:
             with open(AGENT_TRUST_FILE, "r") as f:
@@ -124,7 +231,7 @@ class LDPSecurityEnforcer:
 
     def request_approval(self, tool_name: str, args: dict) -> str:
         hash_val = hashlib.md5(f"{tool_name}{json.dumps(args)}{datetime.now()}".encode()).hexdigest()
-        token = hash_val[0:8]
+        token = typing.cast(Any, hash_val)[0:8]
         self.pending_approvals[token] = {"tool": tool_name, "args": args, "expires": datetime.now().timestamp() + 300}
         return token
 
@@ -170,9 +277,8 @@ class PersonalDataShield:
         # 3. Layer 5: Identity Anonymization (First Name Only)
         # Heuristic for Full Names (Capitalized Word followed by Capitalized Word)
         # We avoid matching common words by requiring a 2-word sequence at the start of entries or in contact fields
-        name_pattern = r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b"
-        # We only apply this safely if it looks like a contact list or message header
         # For now, let's apply it globally but be careful not to break common phrases like "Google Chrome"
+        name_pattern = r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b"
         # Actually, let's keep it simple: Replace "First Last" with "First [MASKED]"
         EXEMPT_NAMES = {
             # Generic title-case words that are NOT personal names
@@ -387,16 +493,17 @@ DISCOVERED_EXPORTS: Dict[str, Any] = {}
 
 CATEGORY_MAP = {
     "browser":       ["chrome", "brave", "firefox", "safari", "edge", "arc"],
-    "communication": ["signal", "whatsapp", "imessage", "telegram", "messages"],
-    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm", "calendar", "contacts"],
+    "communication": ["signal", "whatsapp", "imessage", "telegram", "messages", "mail"],
+    "work":          ["slack", "zoom", "vscode", "cursor", "git", "jira", "linear", "teams", "webex", "pycharm", "calendar", "contacts", "reminders"],
     "personal":      ["claude", "spotify", "notes", "animoji", "photos"],
     "system":        ["shell", "dock", "system", "kernel", "drivefs", "tipkit", "coredatabackend"],
 }
 
 def classify_app(name_key: str) -> str:
     """Map a normalized app name key to a category."""
+    nk = name_key.lower()
     for cat, keywords in CATEGORY_MAP.items():
-        if any(kw in name_key for kw in keywords):
+        if any(kw in nk for kw in keywords):
             return cat
     return "unknown"
 
@@ -543,9 +650,89 @@ approvals = ApprovalManager()
 # All app locations are now discovered by the Node.js scanner
 # and registered in DYNAMIC_PATHS via the list-tools.ts bridge.
 
+def find_db(app_name: str) -> Optional[Path]:
+    """Smart auto-discovery resolver that checks the brain cache first."""
+    name_low = app_name.lower().replace(" ", "_").replace("ldp_", "").replace("_query", "")
+    brain_path = HOME / ".ldp" / "brain_knowledge.json"
+    
+    # 1. Check Brain Cache
+    if brain_path.exists():
+        try:
+            with open(brain_path) as f:
+                brain = json.load(f)
+            
+            # Check learned mappings
+            for k, v in brain.get("learned", {}).items():
+                if isinstance(v, dict) and "appName" in v:
+                    if name_low in v["appName"].lower().replace(" ", "_"):
+                        p = Path(v.get("filePath", ""))
+                        if p.exists():
+                            return p
+            
+            # Check path_map mappings
+            for path_str, app_val in brain.get("path_map", {}).items():
+                if name_low in app_val.lower().replace(" ", "_"):
+                    p = Path(path_str)
+                    if p.exists():
+                        return p
+        except Exception as e:
+            sys.stderr.write(f"Brain read error in find_db: {e}\\n")
+
+    # 2. Check DYNAMIC_PATHS if populated by background scanner
+    if name_low in DYNAMIC_PATHS:
+        p = Path(DYNAMIC_PATHS[name_low])
+        if p.exists():
+            return p
+    for t_name, p_str in DYNAMIC_PATHS.items():
+        if name_low in t_name.lower():
+            p = Path(p_str)
+            if p.exists():
+                return p
+
+    # 3. Fallback standard paths (hardcoded fallbacks only if cache misses)
+    fallbacks: Dict[str, Path] = {
+        "imessage": HOME / "Library/Messages/chat.db",
+        "notes": HOME / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+        "calendar": HOME / "Library/Calendars/Calendar Cache",
+        "safari": HOME / "Library/Safari/History.db",
+        "chrome": HOME / "Library/Application Support/Google/Chrome/Default/History",
+        "brave": HOME / "Library/Application Support/BraveSoftware/Brave-Browser/Default/History",
+        "edge": HOME / "Library/Application Support/Microsoft Edge/Default/History",
+        "contacts": HOME / "Library/Application Support/AddressBook/Sources",
+        "whatsapp": HOME / "Library/Group Containers/group.net.whatsapp.whatsapp.shared"
+    }
+    
+    if name_low == "whatsapp" and not fallbacks["whatsapp"].exists():
+        fallbacks["whatsapp"] = HOME / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+    
+    for key, path in fallbacks.items():
+        if key in name_low:
+            if path.exists():
+                # Cache it back to brain for next time
+                try:
+                    with open(brain_path) as f:
+                        brain = json.load(f)
+                except:
+                    brain = {"learned": {}, "path_map": {}}
+                
+                learned_dict = typing.cast(Any, brain).setdefault("learned", {})
+                learned_dict[f"ldp_{key}_query"] = {"appName": key, "filePath": str(path)}
+                try:
+                    with open(brain_path, "w") as f:
+                        json.dump(brain, f, indent=2)
+                except: pass
+                
+                return path
+
+    return None
+
+def safe_query(db_path: Path, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    """Alias for read_sqlite to handle secure querying via Temp DB standard."""
+    return read_sqlite(db_path, sql, params)
+
 
 # ── SQLite reader (lock-safe copy) ────────────────────────────────
-def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
+def read_sqlite(path: Path, query: str, params: tuple = ()) -> List[Dict[str, Any]]:
     """Returns a list of rows (dicts). Strict Read-Only."""
     if not query.strip().lower().startswith("select"):
         logging.warning(f"BLOCKED_WRITE_QUERY | {query}")
@@ -559,14 +746,14 @@ def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
         shutil.copy2(path, tmp.name)
         con = sqlite3.connect(tmp.name)
         con.row_factory = sqlite3.Row
-        rows = [dict(r) for r in con.execute(query).fetchall()]
+        rows = [dict(r) for r in con.execute(query, params).fetchall()]
         con.close()
         return rows
     except PermissionError:
-        sys.stderr.write(f"Permission Denied: {path}\n")
+        sys.stderr.write(f"Permission Denied: {path}\\n")
         return []
     except Exception as e:
-        sys.stderr.write(f"SQLite Error: {e}\n")
+        sys.stderr.write(f"SQLite Error: {e}\\n")
         return []
     finally:
         try: os.unlink(tmp.name)
@@ -578,35 +765,42 @@ def read_sqlite(path: Path, query: str) -> List[Dict[str, Any]]:
 
 def tool_chrome_history(limit: int = 30) -> str:
     """Read browser history from discovered browser databases."""
-    paths = []
-    for t in ["ldp_chrome_query", "ldp_brave_query", "ldp_edge_query"]:
-        p = DYNAMIC_PATHS.get(t)
-        if p and Path(p).exists(): paths.append(Path(p))
+    db_path = find_db("chrome") or find_db("brave") or find_db("edge")
+    if not db_path:
+        return "No database found for Chrome/Brave/Edge history."
     
-    if not paths:
-        return "No browser history found (Chrome/Brave/Edge)."
+    q = f"""
+        SELECT
+          urls.url,
+          urls.title,
+          urls.visit_count,
+          datetime(
+            (visits.visit_time / 1000000) - 11644473600,
+            'unixepoch', 'localtime'
+          ) as visited_at
+        FROM visits
+        JOIN urls ON visits.url = urls.id
+        ORDER BY visits.visit_time DESC
+        LIMIT {limit}
+    """
+    rows = safe_query(db_path, q)
     
-    all_rows: List[Dict] = []
-    for path in paths:
-        try:
-            # Browser history usually has a 'urls' table
-            rows_data = read_sqlite(path, f"SELECT url, title, visit_count FROM urls ORDER BY visit_count DESC LIMIT {limit}")
-            all_rows.extend(rows_data)
-        except: continue
+    if not rows: return "No history entries found."
+    rows.sort(key=lambda x: x.get("visited_at", ""), reverse=True)
     
-    if not all_rows: return "No history entries found."
-    all_rows.sort(key=lambda x: x.get("visit_count", 0), reverse=True)
-    
-    out: List[str] = [f"{'URL':<60} {'VISITS':>6}"]
-    r_slice = typing.cast(Any, all_rows)[:limit]
+    out: List[str] = [f"{'VISITED AT':<20} {'URL':<60} {'TITLE'}"]
+    r_slice = typing.cast(Any, rows)[:limit]
     for r in r_slice:
-        url_raw = str(r.get("url", ""))
-        url_str = typing.cast(Any, url_raw)[:58]
-        visits  = int(r.get("visit_count", 0))
-        out.append(f"{url_str:<60} {visits:>6}")
-    return "\n".join(out)
+        ts = r.get("visited_at", "")
+        u_val = r.get("url", "")
+        t_val = r.get("title", "")
+        url = typing.cast(Any, str(u_val))[0:58] if u_val else ""
+        title = typing.cast(Any, str(t_val))[0:60] if t_val else ""
+        out.append(f"{ts:<20} {url:<60} {title}")
+    return "\\n".join(out)
 
 def tool_shell_history(limit: int = 50) -> str:
+    # Not refactored to find_db since shell history uses text logs. Standard fallback logic matches shell usage.
     hists = [HOME / ".zsh_history", HOME / ".bash_history"]
     for h in hists:
         if h.exists():
@@ -621,143 +815,122 @@ def tool_shell_history(limit: int = 50) -> str:
                         out.append(cmd)
                         seen.add(cmd)
                         if len(out) >= limit: break
-                return "\n".join(out)
+                return "\\n".join(out)
             except: continue
     return "No shell history found."
 
 def tool_imessage_history(limit: int = 50, query: str = "") -> str:
     """Read recent iMessage history using Apple's local SQLite database."""
-    db_path = HOME / "Library/Messages/chat.db"
-    if not db_path.exists():
-        return "Error: chat.db not found. Ensure Full Disk Access is granted to your terminal/cursor."
+    db_path = find_db("imessage")
+    if not db_path:
+        return "Error: iMessage chat.db not found. Ensure Full Disk Access is granted."
     
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp_path = tmp.name
+    q = f"""
+        SELECT
+            message.text,
+            message.is_from_me,
+            datetime(
+                message.date/1000000000 + 978307200,
+                'unixepoch',
+                'localtime'
+            ) as sent_at,
+            handle.id as sender
+        FROM message
+        LEFT JOIN handle ON message.handle_id = handle.rowid
+        WHERE message.text IS NOT NULL
+        {"AND message.text LIKE ?" if query else ""}
+        ORDER BY message.date DESC
+        LIMIT ?
+    """
+    
     try:
-        shutil.copy2(db_path, tmp_path)
-    except Exception as e:
-        return f"Error copying chat.db: {e}"
-        
-    try:
-        conn = sqlite3.connect(tmp_path)
-        cur = conn.cursor()
-        
-        sql = '''
-            SELECT h.id as sender, m.text, 
-                   datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as date
-            FROM message m
-            LEFT JOIN handle h ON m.handle_id = h.ROWID
-            WHERE m.text IS NOT NULL
-        '''
-        if query: sql += " AND m.text LIKE ?"
-        sql += " ORDER BY m.date DESC LIMIT ?"
-        
         args = (f"%{query}%", limit) if query else (limit,)
-        cur.execute(sql, args)
-        rows = cur.fetchall()
+        rows = safe_query(db_path, q, args)
         
         if not rows: return "No messages found."
             
-        out = ["Recent iMessages:\n"]
-        for sender, text, date in reversed(rows):
-            sender_disp = sender if sender else "Me"
-            snippet = text.replace('\n', ' ')
-            if len(snippet) > 80: snippet = snippet[:77] + "..."
-            out.append(f"[{date}] {sender_disp}: {snippet}")
-        return "\n".join(out)
+        out = ["Recent iMessages:"]
+        for r in reversed(rows):
+            sender = r.get("sender") or "Unknown"
+            is_me = r.get("is_from_me")
+            ts = r.get("sent_at", "")
+            text = r.get("text", "").replace('\\n', ' ')
+            
+            sender_name = "You" if is_me else sender
+            out.append(f"{sender_name}: {text} ({ts})")
+            
+        return "\\n".join(out)
     except Exception as e:
         return f"Error querying iMessage: {e}"
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-    return ""
 
 def tool_contacts_history(query: str = "") -> str:
     """Search Apple Contacts."""
-    base_dir = HOME / "Library/Application Support/AddressBook/Sources"
-    if not base_dir.exists(): return "Error: Contacts folder not found."
+    base_dir = find_db("contacts")
+    if base_dir is None or not base_dir.exists(): return "Error: Contacts folder not found."
     
     results = []
-    for db_path in base_dir.rglob("AddressBook-*.abcddb"):
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            shutil.copy2(db_path, tmp_path)
-            conn = sqlite3.connect(tmp_path)
-            cur = conn.cursor()
+    base_p: Path = typing.cast(Path, base_dir)
+    for db_path in base_p.rglob("AddressBook-*.abcddb"):
+        sql = '''
+            SELECT ZABCDRECORD.ZFIRSTNAME, ZABCDRECORD.ZLASTNAME, ZABCDRECORD.ZORGANIZATION,
+                   ZABCDEMAILADDRESS.ZADDRESS, ZABCDPHONENUMBER.ZFULLNUMBER
+            FROM ZABCDRECORD
+            LEFT JOIN ZABCDEMAILADDRESS ON ZABCDEMAILADDRESS.ZOWNER = ZABCDRECORD.Z_PK
+            LEFT JOIN ZABCDPHONENUMBER ON ZABCDPHONENUMBER.ZOWNER = ZABCDRECORD.Z_PK
+            WHERE ZABCDRECORD.ZFIRSTNAME IS NOT NULL OR ZABCDRECORD.ZLASTNAME IS NOT NULL
+        '''
+        rows = safe_query(db_path, sql)
+        
+        for r in rows:
+            f = r.get("ZFIRSTNAME")
+            l = r.get("ZLASTNAME")
+            o = r.get("ZORGANIZATION")
+            e = r.get("ZADDRESS")
+            p = r.get("ZFULLNUMBER")
+            name = list(filter(None, [f, l]))
+            name_str = " ".join(typing.cast(Any, name))
+            if query and query.lower() not in name_str.lower() and (not e or query.lower() not in str(e).lower()):
+                continue
             
-            sql = '''
-                SELECT ZABCDRECORD.ZFIRSTNAME, ZABCDRECORD.ZLASTNAME, ZABCDRECORD.ZORGANIZATION,
-                       ZABCDEMAILADDRESS.ZADDRESS, ZABCDPHONENUMBER.ZFULLNUMBER
-                FROM ZABCDRECORD
-                LEFT JOIN ZABCDEMAILADDRESS ON ZABCDEMAILADDRESS.ZOWNER = ZABCDRECORD.Z_PK
-                LEFT JOIN ZABCDPHONENUMBER ON ZABCDPHONENUMBER.ZOWNER = ZABCDRECORD.Z_PK
-                WHERE ZABCDRECORD.ZFIRSTNAME IS NOT NULL OR ZABCDRECORD.ZLASTNAME IS NOT NULL
-            '''
-            cur.execute(sql)
-            rows = cur.fetchall()
-            
-            for f, l, o, e, p in rows:
-                name = list(filter(None, [f, l]))
-                name_str = " ".join(name)
-                if query and query.lower() not in name_str.lower() and (not e or query.lower() not in e.lower()):
-                    continue
-                
-                details = []
-                if o: details.append(f"Org: {o}")
-                if e: details.append(f"Email: {e}")
-                if p: details.append(f"Phone: {p}")
-                results.append(f"{name_str} - " + ", ".join(details))
-        except: pass
-        finally:
-            try: os.unlink(tmp_path)
-            except: pass
+            details = []
+            if o: details.append(f"Org: {o}")
+            if e: details.append(f"Email: {e}")
+            if p: details.append(f"Phone: {p}")
+            results.append(f"{name_str} - " + ", ".join(details))
             
     if not results: return "No contacts found."
     # Deduplicate and sort
     s_results = sorted(list(set(results)))
-    return "Contacts:\n" + "\n".join(typing.cast(Any, s_results)[:50])
+    return "Contacts:\\n" + "\\n".join(typing.cast(Any, s_results)[:50])
 
 def tool_calendar_history(limit: int = 50) -> str:
     """Read recent/upcoming Apple Calendar events."""
-    db_path = HOME / "Library/Calendars/Calendar Cache"
-    if not db_path.exists(): return "Error: Calendar Cache not found."
-        
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        shutil.copy2(db_path, tmp_path)
-    except: return "Error copying calendar db"
+    db_path = find_db("calendar")
+    if not db_path: return "Error: Calendar Cache not found."
     
-    try:
-        conn = sqlite3.connect(tmp_path)
-        cur = conn.cursor()
-        
-        sql = '''
-            SELECT ZTITLE, 
-                   datetime(ZSTARTDATE + 978307200, 'unixepoch', 'localtime') as start,
-                   datetime(ZENDDATE + 978307200, 'unixepoch', 'localtime') as end,
-                   ZLOCATION
-            FROM ZCALENDARITEM
-            WHERE ZTITLE IS NOT NULL
-            ORDER BY ZSTARTDATE DESC
-            LIMIT ?
-        '''
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-        
-        if not rows: return "No events found."
-        
-        out = ["Calendar Events:\n"]
-        for title, start, end, loc in rows:
-            loc_str = f" at {loc}" if loc else ""
-            out.append(f"[{start} to {end}] {title}{loc_str}")
-        return "\n".join(out)
-    except Exception as e: return f"Error reading Calendar: {e}"
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-    return ""
+    sql = '''
+        SELECT ZTITLE, 
+               datetime(ZSTARTDATE + 978307200, 'unixepoch', 'localtime') as start,
+               datetime(ZENDDATE + 978307200, 'unixepoch', 'localtime') as end,
+               ZLOCATION
+        FROM ZCALENDARITEM
+        WHERE ZTITLE IS NOT NULL
+        ORDER BY ZSTARTDATE DESC
+        LIMIT ?
+    '''
+    rows = safe_query(db_path, sql, (limit,))
+    
+    if not rows: return "No events found."
+    
+    out = ["Calendar Events:\\n"]
+    for r in rows:
+        title = r.get("ZTITLE")
+        start = r.get("start")
+        end = r.get("end")
+        loc = r.get("ZLOCATION")
+        loc_str = f" at {loc}" if loc else ""
+        out.append(f"[{start} to {end}] {title}{loc_str}")
+    return "\\n".join(out)
 
 def tool_claude_history(limit: int = 20, query: str = "") -> str:
     """Read Claude Desktop local session history and MCP config."""
@@ -954,39 +1127,26 @@ import re
 
 def tool_fused_whatsapp_query(args: dict) -> str:
     """Specialized handler for WhatsApp local data joining contacts."""
-    wa_base1 = HOME / "Library/Group Containers/group.net.whatsapp.whatsapp.shared"
-    wa_base2 = HOME / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+    wa_base = find_db("whatsapp")
+    if not wa_base: return "WhatsApp base directory not found."
+    if wa_base.is_file(): wa_base = wa_base.parent
     
-    candidates_chat = [wa_base1 / "ChatStorage.sqlite", wa_base2 / "ChatStorage.sqlite"]
-    candidates_contacts = [wa_base1 / "ContactsV2.sqlite", wa_base2 / "ContactsV2.sqlite"]
+    chat_fp = wa_base / "ChatStorage.sqlite"
+    contacts_fp = wa_base / "ContactsV2.sqlite"
     
-    chat_fp = next((fp for fp in candidates_chat if fp.exists()), None)
-    contacts_fp = next((fp for fp in candidates_contacts if fp.exists()), None)
-    
-    if not chat_fp or not contacts_fp:
-        return "WhatsApp ChatStorage or ContactsV2 databases not found."
+    if not chat_fp.exists() or not contacts_fp.exists():
+        return "WhatsApp ChatStorage or ContactsV2 databases not found in discovered path."
     
     limit = args.get("limit", 20)
     
-    tmp_chat = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp_contacts = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp_chat.close()
-    tmp_contacts.close()
-    
     ret_val = ""
     try:
-        shutil.copy2(str(chat_fp), tmp_chat.name)
-        shutil.copy2(str(contacts_fp), tmp_contacts.name)
-        
-        conn_chat = sqlite3.connect(tmp_chat.name)
-        conn_cont = sqlite3.connect(tmp_contacts.name)
-        conn_chat.row_factory = sqlite3.Row
-        conn_cont.row_factory = sqlite3.Row
-        
+        # Load contacts into memory map
         contacts_map = {}
-        for row in conn_cont.execute("SELECT ZFULLNAME, ZBUSINESSNAME, ZPHONENUMBER FROM ZWAADDRESSBOOKCONTACT"):
-            cn = row["ZFULLNAME"] or row["ZBUSINESSNAME"]
-            ph = row["ZPHONENUMBER"]
+        cont_rows = safe_query(contacts_fp, "SELECT ZFULLNAME, ZBUSINESSNAME, ZPHONENUMBER FROM ZWAADDRESSBOOKCONTACT")
+        for row in cont_rows:
+            cn = row.get("ZFULLNAME") or row.get("ZBUSINESSNAME")
+            ph = row.get("ZPHONENUMBER")
             if cn and ph:
                 norm = "".join(c for c in str(ph) if c.isdigit())
                 contacts_map[norm] = cn
@@ -1001,31 +1161,25 @@ def tool_fused_whatsapp_query(args: dict) -> str:
             ORDER BY ZMESSAGEDATE DESC
             LIMIT {limit}
         """
-        rows = conn_chat.execute(sql).fetchall()
+        rows = safe_query(chat_fp, sql)
         
         results = []
         for r in rows:
-            jid = str(r["ZFROMJID"]) if r["ZFROMJID"] else ""
+            jid = str(r.get("ZFROMJID")) if r.get("ZFROMJID") else ""
             norm_jid = "".join(c for c in jid if c.isdigit())
             sender_name = contacts_map.get(norm_jid, jid)
             
             results.append({
                 "sender_name": sender_name,
-                "message_text": r["ZTEXT"],
-                "timestamp": r["timestamp"]
+                "message_text": r.get("ZTEXT"),
+                "timestamp": r.get("timestamp")
             })
-            
-        conn_chat.close()
-        conn_cont.close()
+
         
-        ret_val = "Fused WhatsApp Data:\n" + json.dumps(results, indent=2)
+        ret_val = "Fused WhatsApp Data:\\n" + json.dumps(results, indent=2)
     except Exception as e:
         ret_val = f"Fused WhatsApp Error: {e}"
-    finally:
-        try: os.unlink(tmp_chat.name)
-        except: pass
-        try: os.unlink(tmp_contacts.name)
-        except: pass
+    
     return ret_val
 
 def tool_fused_context(args: dict) -> str:
@@ -1097,54 +1251,62 @@ def tool_fused_context(args: dict) -> str:
 
 def tool_whatsapp_query(args: dict) -> str:
     """Specialized handler for WhatsApp local data (readable only)."""
-    wa_base1 = HOME / "Library/Group Containers/group.net.whatsapp.whatsapp.shared"
-    wa_base2 = HOME / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+    wa_base = find_db("whatsapp")
+    if not wa_base: return "WhatsApp base directory not found."
+    if wa_base.is_file(): wa_base = wa_base.parent
     
-    candidates = [
-        wa_base2 / "ChatStorage.sqlite",
-        wa_base1 / "CallHistory.sqlite",
-        wa_base1 / "ContactsV2.sqlite",
-        wa_base1 / "fts/ChatSearchV5f.sqlite"
-    ]
+    chat_fp = wa_base / "ChatStorage.sqlite"
+    contacts_fp = wa_base / "ContactsV2.sqlite"
     
-    exists = [fp for fp in candidates if fp.exists()]
-    if not exists: return "WhatsApp databases not found."
+    if not chat_fp.exists(): return "WhatsApp ChatStorage not found."
 
-    query = args.get("query", "")
     limit = args.get("limit", 10)
     
-    if query:
-        for fp in exists:
-            data = read_sqlite(fp, query)
-            if data is not None:
-                d_slice = typing.cast(Any, data)[:limit]
-                return f"WhatsApp Data ({fp.name}):\n" + json.dumps(d_slice, indent=2)
-        return "Query failed on all WhatsApp databases. Check table names or SQL syntax."
-        
-    results = []
-    for fp in exists:
+    contacts_map = {}
+    if contacts_fp.exists():
         try:
-            tables = read_sqlite(fp, "SELECT name FROM sqlite_master WHERE type='table'")
-            if not tables: continue
-            best_table = None
-            max_r = 0
-            for t in [d['name'] for d in tables]:
-                rc = read_sqlite(fp, f"SELECT count(*) as c FROM \"{t}\"")
-                if rc and rc[0]['c'] > max_r:
-                    max_r = rc[0]['c']
-                    best_table = t
-            
-            if best_table:
-                data = read_sqlite(fp, f"SELECT * FROM \"{best_table}\" LIMIT {limit}")
-                results.append({ "file": fp.name, "rows": max_r, "sample": data })
-        except: continue
-        
-    if not results: return "No readable WhatsApp databases found (or zero rows)."
+            cont_rows = safe_query(contacts_fp, "SELECT ZWHATSAPPID, ZFULLNAME FROM ZWAADDRESSBOOKCONTACT WHERE ZFULLNAME IS NOT NULL")
+            for r in cont_rows:
+                jid = r.get("ZWHATSAPPID")
+                name = r.get("ZFULLNAME")
+                if jid and name:
+                    contacts_map[str(jid)] = name
+        except: pass
+
+    # 2. Query messages
+    q = f"""
+        SELECT
+            ZTEXT as message,
+            ZFROMJID as sender_raw,
+            ZISFROMME as i_sent,
+            datetime(ZMESSAGEDATE + 978307200, 'unixepoch', 'localtime') as sent_at
+        FROM ZWAMESSAGE
+        WHERE ZTEXT IS NOT NULL
+        ORDER BY ZMESSAGEDATE DESC
+        LIMIT {limit}
+    """
     
-    # Return result with most rows
-    results.sort(key=lambda x: x['rows'], reverse=True)
-    best = results[0]
-    return f"WhatsApp Data ({best['file']}, {best['rows']} rows):\n" + json.dumps(best['sample'], indent=2)
+    try:
+        rows = safe_query(chat_fp, q)
+        if not rows: return "No WhatsApp messages found."
+        
+        out = []
+        for r in reversed(rows):
+            text = r.get("message", "").replace('\\n', ' ')
+            sender_raw = str(r.get("sender_raw", ""))
+            i_sent = r.get("i_sent")
+            ts = r.get("sent_at", "")
+            
+            if i_sent == 1 or str(i_sent) == 'True':
+                sender = "You"
+            else:
+                sender = contacts_map.get(sender_raw, sender_raw.split('@')[0])
+                
+            out.append(f"{sender}: {text}  ({ts})")
+            
+        return "\\n".join(out)
+    except Exception as e:
+        return f"Error querying WhatsApp: {e}"
 
 def tool_signal_query(args: dict) -> str:
     """Signal database handler (Encrypted - requires consent gate)."""
@@ -1441,15 +1603,16 @@ def tool_vision_scan(args: dict) -> str:
             "timestamp": datetime.now().isoformat(),
             "note": "Vision snapshot stored in LDP brain. AI now has visual context.",
             "data_preview": "Structured OCR results extracted from pixel-state.",
-            "_vision_payload_preview": f"base64:{b64_img[:64]}..."
+            "_vision_payload_preview": f"base64:{typing.cast(Any, str(b64_img))[0:64]}..."
         })
     except Exception as e:
         logging.error(f"VISION_BRIDGE_ERROR | {str(e)}")
         return json.dumps({"error": f"Vision scan failed: {str(e)}"})
     finally:
         if os.path.exists(tmp_img):
-            try: os.remove(tmp_img)
+            try: os.unlink(tmp_img)
             except: pass
+    return json.dumps({"error": "Vision scan reached unexpected end point."})
 
 def tool_diagnostics() -> str:
     """Check server health and capabilities."""
@@ -1464,12 +1627,166 @@ def tool_diagnostics() -> str:
         "discovered_apps_count": len(DISCOVERED_APPS),
         "capabilities": ["Signal-SQLCipher", "iMessage-SmartQuery", "AppleNotes-Heuristic", "AppleMail-GmailProxy", "Dynamic-AutoConnect", "Global-Search", "FDA-Diagnostics"]
     }, indent=2)
+def tool_daily_summary(args: dict) -> str:
+    limit = args.get("limit", 20)
+    out = ["=== LDP Daily Summary ==="]
+    
+    out.append("\\n[Chrome History]")
+    try:
+        out.append(tool_chrome_history(limit))
+    except Exception as e: out.append(f"Error: {e}")
+    
+    out.append("\\n[iMessage History]")
+    try:
+        out.append(tool_imessage_history(limit))
+    except Exception as e: out.append(f"Error: {e}")
+    
+    out.append("\\n[Calendar]")
+    try:
+        out.append(tool_calendar_history(limit))
+    except Exception as e: out.append(f"Error: {e}")
+        
+    return "\\n".join(out)
 
+def tool_agent_action(args: dict) -> str:
+    action = args.get("action", "")
+    if not action: return "Action string required."
+    
+    log_path = os.path.expanduser("~/.ldp/agent.log")
+    with open(log_path, "a") as f:
+        f.write(f"{datetime.now(timezone.utc).isoformat()} | ACTION: {action}\\n")
+    return f"Agent action '{action}' logged successfully."
+def tool_personal_crm(args: dict) -> str:
+    """Query Apple Contacts and WhatsApp Contacts, returning a combined deduplicated list."""
+    contacts = set()
+    
+    # 1. Apple Contacts
+    apple_db = find_db("contacts")
+    if apple_db:
+        try:
+            rows = safe_query(apple_db, "SELECT ZFIRSTNAME, ZLASTNAME, ZORGANIZATION FROM ZABCDRECORD")
+            for r in rows:
+                first = r.get("ZFIRSTNAME") or ""
+                last = r.get("ZLASTNAME") or ""
+                org = r.get("ZORGANIZATION") or ""
+                name = f"{first} {last}".strip()
+                if not name: name = org
+                if name: contacts.add(name)
+        except: pass
+        
+    # 2. WhatsApp Contacts
+    wa_base = find_db("whatsapp")
+    if wa_base:
+        if wa_base.is_file(): wa_base = wa_base.parent
+        wa_contacts_fp = wa_base / "ContactsV2.sqlite"
+        if wa_contacts_fp.exists():
+            try:
+                cont_rows = safe_query(wa_contacts_fp, "SELECT ZFULLNAME FROM ZWAADDRESSBOOKCONTACT WHERE ZFULLNAME IS NOT NULL")
+                for r in cont_rows:
+                    name = r.get("ZFULLNAME", "").strip()
+                    if name: contacts.add(name)
+            except: pass
+            
+    if not contacts:
+        return "No contacts found across Apple Contacts or WhatsApp."
+        
+    out = ["=== LDP Personal CRM (Fused Contacts) ==="]
+    for c in sorted(list(contacts)):
+        out.append(f"- {c}")
+    return "\\n".join(out)
+
+def tool_fused_query(args: dict) -> str:
+    """Query iMessage and WhatsApp for a specific phone number and combine chronological thread."""
+    phone = args.get("phone_number", "")
+    if not phone: return "Error: phone_number is required."
+    
+    limit = args.get("limit", 20)
+    messages = []
+    
+    # 1. iMessage
+    im_db = find_db("imessage")
+    if im_db:
+        try:
+            q_im = f"""
+                SELECT
+                  message.text,
+                  message.is_from_me,
+                  (message.date / 1000000000 + 978307200) as ts_raw,
+                  datetime(message.date / 1000000000 + 978307200, 'unixepoch', 'localtime') as sent_at,
+                  handle.id as sender
+                FROM message
+                LEFT JOIN handle ON message.handle_id = handle.rowid
+                WHERE message.text IS NOT NULL AND handle.id LIKE ?
+                ORDER BY message.date DESC
+                LIMIT ?
+            """
+            im_rows = safe_query(im_db, q_im, (f"%{phone}%", limit))
+            for r in im_rows:
+                is_me = r.get("is_from_me")
+                sender = "You" if (is_me == 1 or str(is_me) == 'True') else (r.get("sender") or phone)
+                messages.append({
+                    "ts": r.get("ts_raw", 0),
+                    "source": "iMessage",
+                    "sender": sender,
+                    "text": r.get("text", "").replace('\\n', ' '),
+                    "time_str": r.get("sent_at", "")
+                })
+        except: pass
+
+    # 2. WhatsApp
+    wa_base = find_db("whatsapp")
+    if wa_base:
+        if wa_base.is_file(): wa_base = wa_base.parent
+        chat_fp = wa_base / "ChatStorage.sqlite"
+        if chat_fp.exists():
+            try:
+                # Clean phone for WA matching (WA strips +, includes @s.whatsapp.net usually but ZFROMJID stores it)
+                clean_phone = ''.join(filter(str.isdigit, phone))
+                q_wa = f"""
+                    SELECT
+                        ZTEXT as message,
+                        ZFROMJID as sender_raw,
+                        ZISFROMME as i_sent,
+                        (ZMESSAGEDATE + 978307200) as ts_raw,
+                        datetime(ZMESSAGEDATE + 978307200, 'unixepoch', 'localtime') as sent_at
+                    FROM ZWAMESSAGE
+                    WHERE ZTEXT IS NOT NULL AND ZFROMJID LIKE ?
+                    ORDER BY ZMESSAGEDATE DESC
+                    LIMIT ?
+                """
+                wa_rows = safe_query(chat_fp, q_wa, (f"%{clean_phone}%", limit))
+                for r in wa_rows:
+                    i_sent = r.get("i_sent")
+                    sender_raw = str(r.get("sender_raw", ""))
+                    sender = "You" if (i_sent == 1 or str(i_sent) == 'True') else sender_raw.split('@')[0]
+                    messages.append({
+                        "ts": r.get("ts_raw", 0),
+                        "source": "WhatsApp",
+                        "sender": sender,
+                        "text": r.get("message", "").replace('\\n', ' '),
+                        "time_str": r.get("sent_at", "")
+                    })
+            except: pass
+            
+    if not messages:
+        return f"No messages found for {phone} in iMessage or WhatsApp."
+        
+    messages.sort(key=lambda x: x["ts"])
+    
+    out = [f"=== Fused Thread for {phone} ==="]
+    for m in messages[-limit:]:
+        out.append(f"[{m['source']}] {m['time_str']} | {m['sender']}: {m['text']}")
+    return "\\n".join(out)
 
 
 # ── MCP Protocol ──────────────────────────────────────────────────
 
 ALL_STATIC_TOOLS = [
+    {"name": "ldp_daily_summary", "description": "Get a unified snapshot of the user's day (Chrome, iMessage, Calendar).", "inputSchema": {"type":"object", "properties": {"limit": {"type": "integer"}}}},
+    {"name": "ldp_agent_action", "description": "Log an autonomous agent action to the user's personal audit trail.", "inputSchema": {"type":"object", "properties": {"action": {"type": "string"}}}},
+    {"name": "ldp_personal_crm", "description": "Query Apple Contacts and WhatsApp to extract a deduplicated list of people you know.", "inputSchema": {"type":"object", "properties": {}}},
+    {"name": "ldp_fused_query", "description": "Query all messaging apps (iMessage, WhatsApp) for a unified chronological thread with a specific phone number.", "inputSchema": {"type":"object", "properties": {"phone_number": {"type": "string"}, "limit": {"type": "integer"}}}},
+    {"name": "ldp_audit_log", "description": "Read the LDP audit log.", "inputSchema": {"type":"object", "properties": {"limit": {"type": "integer"}}}},
     {"name": "ldp_diagnostics", "description": "Check LDP server status and version.", "inputSchema": {"type":"object"}},
     {"name": "ldp_check_permissions", "description": "Check Mac Full Disk Access permissions.", "inputSchema": {"type":"object"}},
     {"name": "ldp_system_health", "description": "Check LDP health, logs, and crashes.", "inputSchema": {"type":"object"}},
@@ -1487,6 +1804,17 @@ ALL_STATIC_TOOLS = [
     {"name": "ldp_secure_action", "description": "Execute a secure action (e.g., order, send) using semantic tokens like {{ADDR_HOME}}. Raw PII is resolved locally and NEVER shared with AI models.", "inputSchema": {"type": "object", "properties": {"action_type": {"type": "string"}, "target_payload": {"type": "string"}}, "required": ["action_type", "target_payload"]}},
     {"name": "ldp_vision_scan", "description": "Capture screenshot of active window and OCR/analyze with GPT-4o Vision to index legacy apps.", "inputSchema": {"type": "object", "properties": {"app_name": {"type": "string", "description": "Name of the app to target (optional)"}}, "required": []}},
     {"name": "ldp_approve_action", "description": "Resume a tool execution that is PENDING_USER_APPROVAL. Requires a valid 8-char approval_token.", "inputSchema": {"type": "object", "properties": {"token": {"type": "string"}}, "required": ["token"]}},
+    {"name": "ldp_version", "description": "LDP v1.0.0 — Local Data Protocol", "inputSchema": {"type":"object"}},
+    {"name": "ldp_chrome_history_query", "description": "Browse history (Chrome, Brave, Edge).", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_imessage_query", "description": "Read recent iMessage history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_whatsapp_query", "description": "Read recent WhatsApp history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_notes_query", "description": "Read local Apple Notes.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_calendar_query", "description": "Read local Apple Calendar events.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_contacts_query", "description": "Search local Apple Contacts.", "inputSchema": {"type":"object", "properties": {"query": {"type":"string"}}}},
+    {"name": "ldp_shell_history_query", "description": "Read terminal command history.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_git_log_query", "description": "Read git commit logs across repos.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_mail_query", "description": "Read local Apple Mail items.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
+    {"name": "ldp_reminders_query", "description": "Read local Apple Reminders.", "inputSchema": {"type":"object", "properties": {"limit": {"type":"integer"}}}},
 ]
 
 TOOLS = []
@@ -1520,15 +1848,22 @@ def make_tool_handler(tool_name):
             if "chrome" in tool_name.lower() and "history" in tool_name.lower():
                 try:
                     q = f"""
-                        SELECT u.url, u.title, u.visit_count,
-                        datetime((u.last_visit_time/1000000)-11644473600,'unixepoch') as visited
-                        FROM urls u
-                        ORDER BY u.last_visit_time DESC
+                        SELECT 
+                          urls.url,
+                          urls.title,
+                          urls.visit_count,
+                          datetime(
+                            (visits.visit_time/1000000)-11644473600,
+                            'unixepoch'
+                          ) as visited_at
+                        FROM visits
+                        JOIN urls ON visits.url = urls.id
+                        ORDER BY visits.visit_time DESC
                         LIMIT {limit}
                     """
                     rows = cur.execute(q).fetchall()
-                    cols = ["url", "title", "visit_count", "visited"]
-                    best = "urls (joined history)"
+                    cols = ["url", "title", "visit_count", "visited_at"]
+                    best = "visits (joined urls)"
                     count = len(rows)
                 except Exception as e:
                     return f"Error executing specific Chrome History query: {e}"
@@ -1575,12 +1910,17 @@ def rebuild_tools():
         "ldp_manage_approvals": "system",
         "ldp_get_semantic_facts": "system",
         "ldp_secure_action": "system",
+        "ldp_version": "system",
+        "ldp_approve_action": "system",
     }
     
     # 1. Register base system tools
     for st in ALL_STATIC_TOOLS:
         st_name = str(st["name"])
-        cat = STATIC_MAP.get(st_name, "unknown")
+        cat = STATIC_MAP.get(st_name)
+        if not cat:
+            app_raw = st_name.replace("ldp_", "").replace("_query", "")
+            cat = classify_app(app_raw)
         TOOL_CATEGORIES[st_name] = cat
         if cat != "system":
             if approvals.is_app_denied(st_name, cat) or approvals.is_app_paused(st_name): continue
@@ -1589,9 +1929,23 @@ def rebuild_tools():
     # 2. Register dynamic apps from Brain
     # Phase 4A: Load from Cache First (Instant Startup)
     cached_paths = discovery_cache.load()
+    
+    # RULE 12 (Launch Fix): Block fake/wrong tools
+    FAKE_TOOLS_BLOCKLIST = {
+        "ldp_cyberbotics_webots_robot_simulator_query",
+        "ldp_webkinz_classic_query",
+        "ldp_webpquicklook_query",
+        "ldp_website_audit_query",
+        "ldp_website_watchman_query",
+        "ldp_webstorm_query",
+        "ldp_webtorrent_desktop_query",
+        "ldp_webull_query"
+    }
+
     if cached_paths:
         new_paths.update(cached_paths)
         for t_name, f_path in cached_paths.items():
+            if t_name in FAKE_TOOLS_BLOCKLIST: continue
             app_raw = t_name.replace("ldp_", "").replace("_query", "")
             cat = classify_app(app_raw)
             TOOL_CATEGORIES[t_name] = cat
@@ -1960,6 +2314,11 @@ def tool_context_now(args):
     return context
 
 TOOL_MAP = {
+    "ldp_daily_summary": lambda a: tool_daily_summary(a),
+    "ldp_agent_action": lambda a: tool_agent_action(a),
+    "ldp_personal_crm": lambda a: tool_personal_crm(a),
+    "ldp_fused_query": lambda a: tool_fused_query(a),
+    "ldp_audit_log": lambda a: tool_audit_log(a),
     "ldp_diagnostics": lambda a: tool_diagnostics(),
     "ldp_check_permissions": lambda a: tool_check_permissions(),
     "ldp_system_health": lambda a: tool_system_health(),
@@ -1967,18 +2326,21 @@ TOOL_MAP = {
     "ldp_query_app": lambda a: tool_query_app(a.get("app_name",""), a.get("query","")),
     "ldp_discover_apps": lambda a: tool_discover_apps(),
     "ldp_manage_approvals": lambda a: tool_manage_approvals(a.get("action",""), a.get("category", "")),
+    "ldp_version": lambda a: f"LDP v{LDP_VERSION} — Local Data Protocol",
+    "ldp_chrome_history_query": lambda a: tool_chrome_history(a.get("limit", 30)),
+    "ldp_imessage_query": lambda a: tool_imessage_history(a.get("limit", 50)),
     "ldp_whatsapp_query": lambda a: tool_whatsapp_query(a),
-    "ldp_vision_scan": lambda a: tool_vision_scan(a),
-    "ldp_fused_whatsapp_query": lambda a: tool_fused_whatsapp_query(a),
-    "ldp_fused_context": lambda a: tool_fused_context(a),
-    "ldp_signal_query": lambda a: tool_signal_query(a),
-    "ldp_telegram_query": lambda a: tool_telegram_query(a),
-    "ldp_active_app": tool_active_app,
-    "ldp_screen_today": tool_screen_today,
-    "ldp_screen_history": tool_screen_history,
-    "ldp_context_now": tool_context_now,
-    "ldp_get_semantic_facts": lambda a: tool_get_semantic_facts(a),
+    "ldp_notes_query": lambda a: tool_query_app("notes", limit=a.get("limit", 10)),
+    "ldp_calendar_query": lambda a: tool_calendar_history(a.get("limit", 50)),
+    "ldp_contacts_query": lambda a: tool_contacts_history(a.get("query", "")),
+    "ldp_shell_history_query": lambda a: tool_shell_history(a.get("limit", 50)),
+    "ldp_git_log_query": lambda a: tool_query_app("git", limit=a.get("limit", 10)),
+    "ldp_mail_query": lambda a: tool_query_app("mail", limit=a.get("limit", 10)),
+    "ldp_reminders_query": lambda a: tool_query_app("reminders", limit=a.get("limit", 10)),
 }
+
+# Ensure TOOL_MAP is typed correctly for the linter if needed
+TOOL_MAP: Dict[str, typing.Callable[[Any], Any]] = TOOL_MAP
 
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -2217,6 +2579,8 @@ def start_dashboard_server():
         sys.stderr.write(f"[LDP] Dashboard hosted on http://127.0.0.1:{port}\n")
 
 def main():
+    if vault_read('api_keys') is None:
+        vault_write('api_keys', {'anthropic': 'dummy_for_now'})
     sys.stderr.write("[LDP] Dynamic Server Starting...\n")
     start_dashboard_server()
 
@@ -2291,8 +2655,12 @@ def main():
                     else:
                         raw_res = TOOL_MAP[name](args)
                     
-                    # Layer 10: Personal Data Shield (Final Filter)
-                    res = PersonalDataShield.filter(str(raw_res))
+                    # Apply PII Shield
+                    res = pii_shield(str(raw_res))
+                    
+                    # Record Audit Log
+                    row_count = len(str(raw_res).split('\\n'))
+                    audit_log(name, row_count)
                     
                     # Layer 3: No-Forward Tagging
                     privacy_header = "[PRIVACY_POLICY] forward_permission: false | expires_at: session_end\n---\n"

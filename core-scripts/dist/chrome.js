@@ -72,9 +72,9 @@ export class ChromeConnector {
         },
         description: "Chrome browsing history — stays on your device.",
     };
-    dbPath = null;
+    dbPath = undefined;
     async discover() {
-        this.dbPath = findFirst(this.descriptor.dataPaths);
+        this.dbPath = findFirst(this.descriptor.dataPaths) || undefined;
         return this.dbPath !== null;
     }
     async schema() { return CHROME_SCHEMA; }

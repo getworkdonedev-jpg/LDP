@@ -162,6 +162,21 @@ The `DelegateRouter` implements an **Attestation Penalty** to prevent unverified
 #### 3.5.3 Negotiation Memoization
 To minimize latency during complex payload negotiations (e.g., Mode 3 Semantic Graph), the `SessionMemoizer` caches fallback events. If a delegate fails a high-mode negotiation twice, it is cached for **30 minutes**, forcing subsequent requests to default to Mode 1 (Structured JSON) instantly.
 
+### 3.6 Multi-Model Cascade (v3.0.0)
+The PACT architecture utilizes a tiered model cascade to balance speed, archival breadth, and reasoning depth.
+
+1. **Level 1: Local Context** (Ollama): Immediate responses for high-entropy local state.
+2. **Level 2: Archival Memory** (Gemini 1.5 Pro): 1.5M+ token window for long-horizon timeline summarization.
+3. **Level 3: Reasoning & Governance** (Claude 3.5 Sonnet): Final answer distillation with PII-Shield and Provenance Citations.
+4. **Level 4: Vision Bridge** (GPT-4o): Multimodal indexing for applications without structured databases.
+
+### 3.7 Provenance Citations
+All LDP-generated answers now include a `provenance` metadata map. This maps AI-generated tokens (e.g., `[1]`) back to local source attributes:
+- **`hash`**: SHA-256 of the source file/row.
+- **`dbPath`**: Local path where the fact was found.
+- **`recency`**: Time-decayed relevance score (1.0 = current).
+- **`snippet`**: A 200-char preview of the raw local context.
+
 ---
 
 ## 4. Wire Format

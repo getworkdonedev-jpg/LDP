@@ -24,6 +24,21 @@ export var RiskTier;
     RiskTier["MEDIUM"] = "MEDIUM";
     RiskTier["HIGH"] = "HIGH";
 })(RiskTier || (RiskTier = {}));
+export var PayloadMode;
+(function (PayloadMode) {
+    PayloadMode[PayloadMode["MODE_0"] = 0] = "MODE_0";
+    PayloadMode[PayloadMode["MODE_1"] = 1] = "MODE_1";
+    PayloadMode[PayloadMode["MODE_2"] = 2] = "MODE_2";
+    PayloadMode[PayloadMode["MODE_3"] = 3] = "MODE_3";
+})(PayloadMode || (PayloadMode = {}));
+export class ContractViolationError extends Error {
+    usage;
+    constructor(usage, message) {
+        super(message);
+        this.usage = usage;
+        this.name = "ContractViolationError";
+    }
+}
 export function createMessage(type, payload = {}, opts = {}) {
     return Object.freeze({
         type,
